@@ -88,6 +88,9 @@ class LoadBalancePolicy:
         states = [state]
         actions = []
         step_info = []
+        n_successful = 0
+        n_failed = 0
+        tried_this_step = set()  # LP ids already tried at current congested link
 
         for step in range(self.config.max_steps):
             if not lightpaths:
@@ -98,19 +101,46 @@ class LoadBalancePolicy:
             util_values = list(link_util.values())
             util_std = float(np.std(util_values)) if util_values else 0
 
-            # Find most congested link
-            most_congested = max(link_util, key=link_util.get)
-            congestion = link_util[most_congested]
+            # Try links from most congested to least until we find a
+            # successful reroute (avoids recording no-op steps)
+            sorted_links = sorted(link_util.items(), key=lambda x: -x[1])
 
-            # Find an LP on that link to reroute
-            target_lp = self._find_lp_on_link(most_congested, lightpaths)
-            if target_lp is None:
-                break
+            action = None
+            success = False
+            target_lp = None
+            congested_link = None
 
-            # Try to reroute to less congested path
-            action, success = self._try_reroute_for_balance(
-                target_lp, lightpaths, link_util, step
-            )
+            for link_id, congestion in sorted_links:
+                target_lp = self._find_lp_on_link(link_id, lightpaths)
+                if target_lp is None:
+                    continue
+                if target_lp.id in tried_this_step:
+                    continue
+
+                tried_this_step.add(target_lp.id)
+                congested_link = link_id
+
+                action, success = self._try_reroute_for_balance(
+                    target_lp, lightpaths, link_util, step
+                )
+                if success:
+                    break
+
+            # If nothing worked across all links, do a fallback reroute
+            # on the most congested link (recorded as failed)
+            if not success:
+                tried_this_step.clear()
+                if congested_link is None:
+                    break
+                # Record a no-op as last resort so episode doesn't stall
+                if target_lp is not None:
+                    action = self._make_noop_action(target_lp, lightpaths)
+                else:
+                    break
+                n_failed += 1
+            else:
+                n_successful += 1
+                tried_this_step.clear()
 
             results, gnpy_ms = self.evaluator.evaluate_all(lightpaths)
             state = self._encode_current_state(lightpaths, results)
@@ -122,14 +152,24 @@ class LoadBalancePolicy:
 
             step_info.append({
                 'step': step,
-                'target_lp': target_lp.id,
-                'congested_link': most_congested,
-                'congestion': congestion,
+                'target_lp': target_lp.id if target_lp else 'none',
+                'congested_link': congested_link,
+                'congestion': link_util.get(congested_link, 0),
                 'util_std_before': util_std,
                 'util_std_after': new_std,
                 'success': success,
                 'gnpy_ms': gnpy_ms,
             })
+
+            # Early termination: if no successful reroute possible for
+            # several consecutive steps, stop
+            if n_failed >= 5 and n_successful == 0:
+                break
+            recent_fails = sum(
+                1 for s in step_info[-5:] if not s['success']
+            )
+            if len(step_info) >= 5 and recent_fails >= 5:
+                break
 
         # Compute utilization variance trajectory
         util_stds = []
@@ -144,6 +184,9 @@ class LoadBalancePolicy:
             'n_steps': len(actions),
             'initial_util_std': util_stds[0] if util_stds else 0,
             'final_util_std': util_stds[-1] if util_stds else 0,
+            'n_successful': n_successful,
+            'n_failed': n_failed,
+            'success_rate': n_successful / max(1, n_successful + n_failed),
             'n_nodes': len(self.spec.node_ids),
             'n_links': len(self.spec.links),
         }
@@ -156,8 +199,13 @@ class LoadBalancePolicy:
         }
 
     def _build_unbalanced_network(self) -> List[LightpathDesc]:
-        """Create intentionally unbalanced load — concentrate on few links."""
-        target_lps = int(MAX_SLOTS * self.config.initial_load_frac)
+        """Create intentionally unbalanced load — concentrate on few links.
+
+        Load is jittered ±50% to diversify starting conditions.
+        """
+        base = self.config.initial_load_frac
+        jittered = self.rng.uniform(base * 0.5, base * 1.5)
+        target_lps = int(MAX_SLOTS * jittered)
         target_lps = max(target_lps, 5)
 
         # Pick 2-3 "hot" src-dst pairs to create imbalance
@@ -219,8 +267,13 @@ class LoadBalancePolicy:
 
     def _find_lp_on_link(
         self, link_id: str, lightpaths: List[LightpathDesc],
+        n_candidates: int = 3,
     ) -> Optional[LightpathDesc]:
-        """Find an LP traversing the given link, prefer multi-hop LPs."""
+        """Find an LP traversing the given link.
+
+        Pick randomly among the top-n longest LPs on that link.
+        Avoids always targeting the same LP when it has no alternative route.
+        """
         candidates = []
         for lp in lightpaths:
             for i in range(lp.n_hops):
@@ -232,9 +285,10 @@ class LoadBalancePolicy:
         if not candidates:
             return None
 
-        # Prefer LPs with more hops (more benefit from rerouting)
+        # Sort by hops descending, pick among top-n
         candidates.sort(key=lambda lp: -lp.n_hops)
-        return candidates[0]
+        pick = min(n_candidates, len(candidates))
+        return candidates[int(self.rng.integers(pick))]
 
     def _try_reroute_for_balance(
         self, lp: LightpathDesc, lightpaths: List[LightpathDesc],
@@ -325,18 +379,24 @@ class LoadBalancePolicy:
 
     # ---- shared helpers ----
 
-    def _first_fit_wavelength(self, route):
+    def _first_fit_wavelength(self, route, top_k: int = 5):
+        """Find an available slot, random among the first top_k free."""
         link_ids = []
         for i in range(len(route) - 1):
             lid = self.link_lookup.get((route[i], route[i + 1]))
             if lid is None:
                 return None
             link_ids.append(lid)
+        free_slots = []
         for slot in range(MAX_SLOTS):
             if all(slot not in self.wl_usage.get(lid, set())
                    for lid in link_ids):
-                return slot
-        return None
+                free_slots.append(slot)
+                if len(free_slots) >= top_k:
+                    break
+        if not free_slots:
+            return None
+        return int(self.rng.choice(free_slots))
 
     def _mark_wavelength(self, lp):
         for i in range(lp.n_hops):

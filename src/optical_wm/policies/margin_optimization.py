@@ -145,8 +145,14 @@ class MarginOptPolicy:
         }
 
     def _build_loaded_network(self) -> List[LightpathDesc]:
-        """Create a loaded network to optimize."""
-        target_lps = int(MAX_SLOTS * self.config.initial_load_frac)
+        """Create a loaded network to optimize.
+
+        Load is jittered ±50% to diversify starting conditions.
+        Uses suboptimal power/modulation to create margin issues.
+        """
+        base = self.config.initial_load_frac
+        jittered = self.rng.uniform(base * 0.5, base * 1.5)
+        target_lps = int(MAX_SLOTS * jittered)
         target_lps = max(target_lps, 5)
 
         lightpaths = []
@@ -189,51 +195,103 @@ class MarginOptPolicy:
     def _find_worst_margin_lp(
         self, lightpaths: List[LightpathDesc],
         results: Dict[str, LightpathResult],
+        n_candidates: int = 3,
     ) -> Tuple[Optional[LightpathDesc], Optional[LightpathResult]]:
-        """Find the LP with the worst margin."""
-        worst_lp = None
-        worst_result = None
-        worst_margin = float('inf')
+        """Pick a target LP randomly among the n worst-margin LPs.
 
+        This avoids getting stuck on a single incorrigible LP and
+        diversifies which LPs get optimized across steps.
+        """
+        scored = []
         for lp in lightpaths:
             r = results.get(lp.id)
             if r is None or r.gsnr_db <= 0:
                 continue
             threshold = MOD_THRESHOLDS.get(lp.modulation, 8.5)
             margin = r.gsnr_db - threshold
-            if margin < worst_margin:
-                worst_margin = margin
-                worst_lp = lp
-                worst_result = r
+            scored.append((margin, lp, r))
 
-        return worst_lp, worst_result
+        if not scored:
+            return None, None
+
+        # Sort by margin ascending (worst first), pick among top-n
+        scored.sort(key=lambda x: x[0])
+        pick = min(n_candidates, len(scored))
+        idx = int(self.rng.integers(pick))
+        _, chosen_lp, chosen_result = scored[idx]
+        return chosen_lp, chosen_result
 
     def _optimize_lp(
         self, lp: LightpathDesc, result: LightpathResult,
         lightpaths: List[LightpathDesc], step: int,
     ) -> Tuple[np.ndarray, bool, str]:
-        """Try to optimize a specific LP. Returns (action, success, strategy)."""
+        """Try to optimize a specific LP. Strategy chosen by margin severity.
 
-        strategy_roll = self.rng.random()
+        Expert logic:
+          margin < -3 dB  → big fix needed: reroute (50%) or mod downgrade (40%)
+          -3 ≤ margin < 0 → moderate fix: mod downgrade (40%) or power (40%)
+          margin ≥ 0       → fine-tuning: power adjust (70%)
 
-        if strategy_roll < 0.5:
-            # Power adjustment
-            action, success = self._try_power_adjust(lp, lightpaths, step)
-            return action, success, 'power_adjust'
-        elif strategy_roll < 0.8:
-            # Modulation downgrade
-            action, success = self._try_mod_change(lp, lightpaths, step)
-            return action, success, 'mod_change'
+        A 10% random noise always applies to inject diversity.
+        """
+        threshold = MOD_THRESHOLDS.get(lp.modulation, 8.5)
+        margin = result.gsnr_db - threshold
+
+        roll = self.rng.random()
+
+        if margin < -3.0:
+            # Severe — need structural change
+            if roll < 0.10:
+                # noise: power adjust (unlikely to help but adds diversity)
+                action, success = self._try_power_adjust(lp, lightpaths, step)
+                return action, success, 'power_adjust'
+            elif roll < 0.50:
+                return self._try_reroute(lp, lightpaths, step)
+            else:
+                return self._try_mod_change(lp, lightpaths, step)
+
+        elif margin < 0.0:
+            # Moderate — could go either way
+            if roll < 0.10:
+                return self._try_reroute(lp, lightpaths, step)
+            elif roll < 0.50:
+                return self._try_mod_change(lp, lightpaths, step)
+            else:
+                action, success = self._try_power_adjust(lp, lightpaths, step)
+                return action, success, 'power_adjust'
+
         else:
-            # Reroute
-            action, success = self._try_reroute(lp, lightpaths, step)
-            return action, success, 'reroute'
+            # Positive margin — fine-tuning
+            if roll < 0.70:
+                action, success = self._try_power_adjust(lp, lightpaths, step)
+                return action, success, 'power_adjust'
+            elif roll < 0.90:
+                return self._try_mod_change(lp, lightpaths, step)
+            else:
+                return self._try_reroute(lp, lightpaths, step)
 
     def _try_power_adjust(
         self, lp: LightpathDesc, lightpaths: List[LightpathDesc], step: int,
     ) -> Tuple[np.ndarray, bool]:
-        """Adjust LP launch power."""
-        delta = self.rng.choice([-1.0, -0.5, 0.5, 1.0])
+        """Adjust LP launch power.
+
+        Biased toward increasing power when margin is negative (more signal),
+        and toward decreasing when margin is positive (reduce NLI on neighbors).
+        10% random inversion for diversity.
+        """
+        threshold = MOD_THRESHOLDS.get(lp.modulation, 8.5)
+        # Use last known GSNR approximation from launch power context
+        if self.rng.random() < 0.10:
+            # Random direction (noise)
+            delta = self.rng.choice([-1.0, -0.5, 0.5, 1.0])
+        else:
+            # Expert direction: positive delta when we need more signal
+            magnitude = self.rng.choice([0.5, 1.0])
+            delta = magnitude  # default: increase power
+            # If power is already high, try decreasing (reduce NLI on neighbors)
+            if lp.launch_power_dbm >= 1.5:
+                delta = -magnitude
+
         new_power = np.clip(
             lp.launch_power_dbm + delta,
             self.config.power_min_db,
@@ -261,16 +319,17 @@ class MarginOptPolicy:
 
     def _try_mod_change(
         self, lp: LightpathDesc, lightpaths: List[LightpathDesc], step: int,
-    ) -> Tuple[np.ndarray, bool]:
-        """Downgrade modulation for more margin."""
+    ) -> Tuple[np.ndarray, bool, str]:
+        """Downgrade modulation for more margin. Returns (action, success, actual_strategy)."""
         old_mod = lp.modulation
         if old_mod == Modulation.QAM64:
             new_mod = Modulation.QAM16
         elif old_mod == Modulation.QAM16:
             new_mod = Modulation.QPSK
         else:
-            # Already QPSK, try power adjust instead
-            return self._try_power_adjust(lp, lightpaths, step)
+            # Already QPSK, fallback to power adjust
+            action, success = self._try_power_adjust(lp, lightpaths, step)
+            return action, success, 'power_adjust_fallback'
 
         lp.modulation = new_mod
 
@@ -288,18 +347,19 @@ class MarginOptPolicy:
             wavelength_slot=lp.wavelength_slot,
             modulation=int(new_mod),
         )
-        return action, True
+        return action, True, 'mod_change'
 
     def _try_reroute(
         self, lp: LightpathDesc, lightpaths: List[LightpathDesc], step: int,
-    ) -> Tuple[np.ndarray, bool]:
-        """Try an alternative route."""
+    ) -> Tuple[np.ndarray, bool, str]:
+        """Try an alternative route. Returns (action, success, actual_strategy)."""
         try:
             paths = list(nx.shortest_simple_paths(
                 self.graph, lp.source, lp.destination, weight='weight'
             ))[:self.config.k_shortest_paths]
         except (nx.NetworkXNoPath, nx.NodeNotFound):
-            return self._try_power_adjust(lp, lightpaths, step)
+            action, success = self._try_power_adjust(lp, lightpaths, step)
+            return action, success, 'power_adjust_fallback'
 
         # Find a different route with available wavelength
         for path in paths:
@@ -334,28 +394,36 @@ class MarginOptPolicy:
                     route=route_indices,
                     wavelength_slot=slot,
                 )
-                return action, True
+                return action, True, 'reroute'
             else:
                 # Restore old wavelength
                 self._mark_wavelength(lp)
 
         # All routes failed, fallback to power adjust
-        return self._try_power_adjust(lp, lightpaths, step)
+        action, success = self._try_power_adjust(lp, lightpaths, step)
+        return action, success, 'power_adjust_fallback'
 
     # ---- shared helpers (same as provisioning) ----
 
-    def _first_fit_wavelength(self, route: List[str]) -> Optional[int]:
+    def _first_fit_wavelength(self, route: List[str],
+                              top_k: int = 5) -> Optional[int]:
+        """Find an available slot, random among the first top_k free."""
         link_ids = []
         for i in range(len(route) - 1):
             lid = self.link_lookup.get((route[i], route[i + 1]))
             if lid is None:
                 return None
             link_ids.append(lid)
+        free_slots = []
         for slot in range(MAX_SLOTS):
             if all(slot not in self.wl_usage.get(lid, set())
                    for lid in link_ids):
-                return slot
-        return None
+                free_slots.append(slot)
+                if len(free_slots) >= top_k:
+                    break
+        if not free_slots:
+            return None
+        return int(self.rng.choice(free_slots))
 
     def _mark_wavelength(self, lp: LightpathDesc):
         for i in range(lp.n_hops):

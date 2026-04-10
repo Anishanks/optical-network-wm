@@ -45,6 +45,9 @@ def test_episode_completes():
     print(f"  Steps: {meta['n_steps']}")
     print(f"  Initial util std: {meta['initial_util_std']:.4f}")
     print(f"  Final util std: {meta['final_util_std']:.4f}")
+    print(f"  Successful: {meta['n_successful']}, "
+          f"Failed: {meta['n_failed']}, "
+          f"Rate: {meta['success_rate']:.0%}")
     print(f"  Time: {elapsed:.1f}s")
     print("✓ Episode completes OK")
     return ep
@@ -83,6 +86,95 @@ def test_lp_count_stable(ep=None):
     print("✓ LP count stable OK")
 
 
+def test_success_rate(ep=None):
+    """Most reroutes should actually change the network state."""
+    print("\n--- Test 2L.5: Success rate ---")
+    if ep is None:
+        policy, _ = setup(seed=42, max_steps=15)
+        ep = policy.generate_episode()
+
+    meta = ep['metadata']
+    rate = meta['success_rate']
+
+    print(f"  Successful: {meta['n_successful']}")
+    print(f"  Failed (no-ops): {meta['n_failed']}")
+    print(f"  Success rate: {rate:.0%}")
+
+    assert rate >= 0.3, (
+        f"Success rate too low: {rate:.0%}. "
+        f"Most steps are no-ops — network may be too constrained."
+    )
+    print("✓ Success rate OK")
+
+
+def test_spectrum_changes_on_success(ep=None):
+    """Successful reroutes must change the spectral occupancy on ≥2 links."""
+    print("\n--- Test 2L.6: Spectrum changes on success ---")
+    if ep is None:
+        policy, _ = setup(seed=42, max_steps=15)
+        ep = policy.generate_episode()
+
+    states = ep['states']
+    step_info = ep['step_info']
+    n_checked = 0
+    n_changed = 0
+
+    for i, si in enumerate(step_info):
+        if not si['success']:
+            continue
+        n_checked += 1
+
+        occ_before = states[i]['spectral_occupancy']
+        occ_after = states[i + 1]['spectral_occupancy']
+        links_changed = np.sum(
+            np.any(occ_before != occ_after, axis=1)
+        )
+
+        if links_changed >= 2:
+            n_changed += 1
+
+    ratio = n_changed / max(1, n_checked)
+    print(f"  Successful reroutes checked: {n_checked}")
+    print(f"  With ≥2 links changed: {n_changed} ({ratio:.0%})")
+
+    if n_checked >= 2:
+        assert ratio >= 0.5, (
+            f"Only {ratio:.0%} of successful reroutes changed ≥2 links. "
+            f"Reroute should affect old route + new route."
+        )
+    print("✓ Spectrum changes OK")
+
+
+def test_utilization_improves(ep=None):
+    """Utilization variance should not increase over the episode."""
+    print("\n--- Test 2L.7: Utilization variance decreases ---")
+    if ep is None:
+        policy, _ = setup(seed=42, max_steps=15)
+        ep = policy.generate_episode()
+
+    meta = ep['metadata']
+    initial_std = meta['initial_util_std']
+    final_std = meta['final_util_std']
+
+    stds = [si['util_std_before'] for si in ep['step_info']]
+    if ep['step_info']:
+        stds.append(ep['step_info'][-1]['util_std_after'])
+
+    T = len(stds)
+    first_half = np.mean(stds[:T // 2]) if T >= 2 else initial_std
+    second_half = np.mean(stds[T // 2:]) if T >= 2 else final_std
+
+    print(f"  Util std: {initial_std:.4f} → {final_std:.4f}")
+    print(f"  First half avg: {first_half:.4f}")
+    print(f"  Second half avg: {second_half:.4f}")
+
+    assert second_half <= first_half + 0.01, (
+        f"Utilization variance increased: {first_half:.4f} → {second_half:.4f}. "
+        f"Load balancing should reduce imbalance."
+    )
+    print("✓ Utilization improves OK")
+
+
 def test_seed_diversity():
     print("\n--- Test 2L.4: Seed diversity ---")
     p1, _ = setup(seed=42, max_steps=10)
@@ -94,8 +186,10 @@ def test_seed_diversity():
     s2 = ep2['states'][-1]['global_features']
     assert not np.array_equal(s1, s2)
 
-    print(f"  Seed 42:  util_std={ep1['metadata']['final_util_std']:.4f}")
-    print(f"  Seed 77:  util_std={ep2['metadata']['final_util_std']:.4f}")
+    print(f"  Seed 42:  util_std={ep1['metadata']['final_util_std']:.4f}, "
+          f"success={ep1['metadata']['success_rate']:.0%}")
+    print(f"  Seed 77:  util_std={ep2['metadata']['final_util_std']:.4f}, "
+          f"success={ep2['metadata']['success_rate']:.0%}")
     print("✓ Seed diversity OK")
 
 
@@ -116,6 +210,9 @@ if __name__ == "__main__":
         ("2L.2 REROUTE actions", test_reroute_actions, True),
         ("2L.3 LP count stable", test_lp_count_stable, True),
         ("2L.4 Seed diversity", test_seed_diversity, False),
+        ("2L.5 Success rate", test_success_rate, True),
+        ("2L.6 Spectrum changes", test_spectrum_changes_on_success, True),
+        ("2L.7 Utilization improves", test_utilization_improves, True),
     ]:
         try:
             if use_ep:

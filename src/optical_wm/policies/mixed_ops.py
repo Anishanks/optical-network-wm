@@ -122,10 +122,17 @@ class MixedOpsPolicy:
                 action, phase = self._random_off_policy(
                     lightpaths, lp_counter, 'provision'
                 )
-                if action is not None and phase == 'remove':
-                    removed_demands.append(
-                        self._record_and_remove_lp(lightpaths)
+                if phase == 'remove':
+                    demand = self._record_and_remove_lp(lightpaths)
+                    removed_demands.append(demand)
+                    src_idx = self.spec.node_ids.index(demand[0])
+                    dst_idx = self.spec.node_ids.index(demand[1])
+                    action = encode_action(
+                        action_type=ActionType.REMOVE,
+                        src_node=src_idx,
+                        dst_node=dst_idx,
                     )
+                    phase = 'provision_noise_remove'
             else:
                 # On-policy: ADD a new LP
                 lp, action = self._try_add(lightpaths, lp_counter)
@@ -154,11 +161,15 @@ class MixedOpsPolicy:
             if self.rng.random() < cfg.epsilon:
                 # Off-policy: ADD or REMOVE during optimization
                 if self.rng.random() < 0.5 and len(lightpaths) > 3:
-                    removed_demands.append(
-                        self._record_and_remove_lp(lightpaths)
+                    demand = self._record_and_remove_lp(lightpaths)
+                    removed_demands.append(demand)
+                    src_idx = self.spec.node_ids.index(demand[0])
+                    dst_idx = self.spec.node_ids.index(demand[1])
+                    action = encode_action(
+                        action_type=ActionType.REMOVE,
+                        src_node=src_idx,
+                        dst_node=dst_idx,
                     )
-                    action = actions[-1] if actions else self._do_power_adjust(lightpaths)
-                    # Re-encode action as the remove we just did
                     phase = 'optimize_noise_remove'
                 else:
                     lp, action = self._try_add(lightpaths, lp_counter)
@@ -484,14 +495,8 @@ class MixedOpsPolicy:
             # Power adjust (always safe)
             return self._do_power_adjust(lightpaths), 'power'
         elif roll < 0.7 and len(lightpaths) > 3:
-            # Remove
-            src_idx = self.spec.node_ids.index(lightpaths[-1].source)
-            dst_idx = self.spec.node_ids.index(lightpaths[-1].destination)
-            action = encode_action(
-                action_type=ActionType.REMOVE,
-                src_node=src_idx, dst_node=dst_idx,
-            )
-            return action, 'remove'
+            # Signal remove — caller handles the actual removal
+            return None, 'remove'
         else:
             # Add
             lp, action = self._try_add(lightpaths, counter)

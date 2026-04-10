@@ -166,6 +166,7 @@ class RecoveryPolicy:
                 pass
 
         restore_counter = 0
+        restore_failed = 0
         for src, dst, modulation in demands_to_restore:
             if len(actions) >= self.config.max_steps:
                 break
@@ -196,12 +197,17 @@ class RecoveryPolicy:
             if slot is None:
                 continue
 
+            # Add power noise for diversity (like provisioning)
+            power = float(np.clip(
+                self.rng.normal(0.0, 0.5), -2.0, 2.0
+            ))
+
             lp = create_lightpath(
                 id=f"lp_restore_{restore_counter:04d}",
                 source=src, destination=dst,
                 route=route, wavelength_slot=slot,
                 modulation=modulation,
-                launch_power_dbm=0.0,
+                launch_power_dbm=power,
             )
 
             lightpaths.append(lp)
@@ -222,6 +228,16 @@ class RecoveryPolicy:
             )
 
             results, gnpy_ms = self.evaluator.evaluate_all(lightpaths)
+
+            # Rollback if restored LP is infeasible (consistent with provisioning)
+            new_result = results.get(lp.id)
+            if new_result and not new_result.feasible:
+                lightpaths.remove(lp)
+                self._release_wavelength(lp)
+                results, _ = self.evaluator.evaluate_all(lightpaths)
+                restore_counter -= 1
+                restore_failed += 1
+
             state = self._encode_current_state(lightpaths, results)
             states.append(state)
             actions.append(action)
@@ -231,6 +247,7 @@ class RecoveryPolicy:
                 'phase': 'restoration',
                 'action_type': 'ADD',
                 'target_lp': lp.id,
+                'feasible': new_result.feasible if new_result else False,
                 'n_lps': len(lightpaths),
                 'gnpy_ms': gnpy_ms,
             })
@@ -238,6 +255,9 @@ class RecoveryPolicy:
         # Count phases
         n_remove = sum(1 for s in step_info if s['phase'] == 'disruption')
         n_add = sum(1 for s in step_info if s['phase'] == 'restoration')
+
+        # Compute GSNR trajectory for metadata
+        avg_margins = [s['global_features'][5] for s in states]
 
         metadata = {
             'policy': 'recovery',
@@ -248,6 +268,11 @@ class RecoveryPolicy:
             'n_restoration_steps': n_add,
             'demands_affected': len(demands_to_restore),
             'demands_restored': restore_counter,
+            'demands_restore_failed': restore_failed,
+            'phase_ratio': n_add / max(1, n_remove),
+            'margin_at_start': float(avg_margins[0]) if avg_margins else 0,
+            'margin_at_trough': float(max(avg_margins)) if avg_margins else 0,
+            'margin_at_end': float(avg_margins[-1]) if avg_margins else 0,
             'n_nodes': len(self.spec.node_ids),
             'n_links': len(self.spec.links),
         }
@@ -260,8 +285,13 @@ class RecoveryPolicy:
         }
 
     def _build_loaded_network(self) -> List[LightpathDesc]:
-        """Create a well-loaded network."""
-        target_lps = int(MAX_SLOTS * self.config.initial_load_frac)
+        """Create a well-loaded network.
+
+        Load is jittered ±50% to diversify starting conditions.
+        """
+        base = self.config.initial_load_frac
+        jittered = self.rng.uniform(base * 0.5, base * 1.5)
+        target_lps = int(MAX_SLOTS * jittered)
         target_lps = max(target_lps, 8)
 
         lightpaths = []
@@ -337,18 +367,24 @@ class RecoveryPolicy:
 
     # ---- shared helpers ----
 
-    def _first_fit_wavelength(self, route):
+    def _first_fit_wavelength(self, route, top_k: int = 5):
+        """Find an available slot, random among the first top_k free."""
         link_ids = []
         for i in range(len(route) - 1):
             lid = self.link_lookup.get((route[i], route[i + 1]))
             if lid is None:
                 return None
             link_ids.append(lid)
+        free_slots = []
         for slot in range(MAX_SLOTS):
             if all(slot not in self.wl_usage.get(lid, set())
                    for lid in link_ids):
-                return slot
-        return None
+                free_slots.append(slot)
+                if len(free_slots) >= top_k:
+                    break
+        if not free_slots:
+            return None
+        return int(self.rng.choice(free_slots))
 
     def _mark_wavelength(self, lp):
         for i in range(lp.n_hops):

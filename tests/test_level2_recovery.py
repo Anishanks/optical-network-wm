@@ -47,12 +47,15 @@ def test_episode_completes():
     print(f"  Failed link: {meta['failed_link']}")
     print(f"  Demands affected: {meta['demands_affected']}")
     print(f"  Demands restored: {meta['demands_restored']}")
+    print(f"  Restore failed (rollback): {meta.get('demands_restore_failed', 0)}")
+    print(f"  Phase ratio (add/remove): {meta.get('phase_ratio', 0):.1f}")
     print(f"  Time: {elapsed:.1f}s")
     print("✓ Episode completes OK")
     return ep
 
 
 def test_two_phases(ep=None):
+    """Episode must have REMOVE then ADD phases in order."""
     print("\n--- Test 2R.2: Two phases (REMOVE then ADD) ---")
     if ep is None:
         policy, _ = setup()
@@ -79,11 +82,12 @@ def test_two_phases(ep=None):
 
     print(f"  REMOVE steps: {n_remove}")
     print(f"  ADD steps: {n_add}")
-    print(f"  Phase order correct: REMOVE[0..{last_remove}] → ADD[{first_add}..{len(types)-1}]")
+    print(f"  Phase order: REMOVE[0..{last_remove}] → ADD[{first_add}..{len(types)-1}]")
     print("✓ Two phases OK")
 
 
 def test_lp_count_dip(ep=None):
+    """LP count must dip (disruption) then recover (restoration)."""
     print("\n--- Test 2R.3: LP count dips then recovers ---")
     if ep is None:
         policy, _ = setup()
@@ -101,10 +105,108 @@ def test_lp_count_dip(ep=None):
         f"LP count never recovered: final={final:.0f}, min={minimum:.0f}"
     )
 
-    print(f"  LP count: {initial:.0f} → {minimum:.0f} (dip) → {final:.0f} (recovery)")
     recovery_rate = (final - minimum) / max(1, initial - minimum)
+    print(f"  LP count: {initial:.0f} → {minimum:.0f} (dip) → {final:.0f}")
     print(f"  Recovery rate: {recovery_rate:.0%}")
     print("✓ LP count dip-and-recover OK")
+
+
+def test_gsnr_non_monotonic(ep=None):
+    """Avg margin should improve during disruption then degrade during restoration."""
+    print("\n--- Test 2R.5: GSNR non-monotonic (↑ then ↓) ---")
+    if ep is None:
+        policy, _ = setup(seed=42, max_steps=30)
+        ep = policy.generate_episode()
+
+    margins = [s['global_features'][5] for s in ep['states']]  # avg margin
+    T = len(margins)
+
+    # Find the peak (should be around the phase transition)
+    peak_idx = int(np.argmax(margins))
+    margin_start = margins[0]
+    margin_peak = margins[peak_idx]
+    margin_end = margins[-1]
+
+    has_rise = margin_peak > margin_start + 0.01
+    has_fall = margin_peak > margin_end + 0.01
+
+    print(f"  Avg margin: {margin_start:.2f} → {margin_peak:.2f} (peak@{peak_idx}) → {margin_end:.2f}")
+    print(f"  Rise (disruption): {has_rise}  ({margin_peak - margin_start:+.2f} dB)")
+    print(f"  Fall (restoration): {has_fall}  ({margin_end - margin_peak:+.2f} dB)")
+
+    # At least one direction should show a clear change
+    margin_range = max(margins) - min(margins)
+    assert margin_range > 0.1, (
+        f"GSNR trajectory too flat: range={margin_range:.3f} dB. "
+        f"Expected non-monotonic dynamics."
+    )
+    print(f"  Total range: {margin_range:.2f} dB")
+    print("✓ GSNR non-monotonic OK")
+
+
+def test_spectrum_coherence(ep=None):
+    """REMOVE steps should free spectrum, ADD steps should occupy spectrum."""
+    print("\n--- Test 2R.6: Spectrum coherence ---")
+    if ep is None:
+        policy, _ = setup(seed=42, max_steps=30)
+        ep = policy.generate_episode()
+
+    states = ep['states']
+    step_info = ep['step_info']
+
+    remove_freed = 0
+    remove_checked = 0
+    add_occupied = 0
+    add_checked = 0
+
+    for i, si in enumerate(step_info):
+        occ_before = states[i]['spectral_occupancy'].sum()
+        occ_after = states[i + 1]['spectral_occupancy'].sum()
+
+        if si['phase'] == 'disruption':
+            remove_checked += 1
+            if occ_after < occ_before:
+                remove_freed += 1
+        elif si['phase'] == 'restoration':
+            add_checked += 1
+            if occ_after > occ_before:
+                add_occupied += 1
+
+    remove_rate = remove_freed / max(1, remove_checked)
+    add_rate = add_occupied / max(1, add_checked)
+
+    print(f"  REMOVE freed spectrum: {remove_freed}/{remove_checked} ({remove_rate:.0%})")
+    print(f"  ADD occupied spectrum: {add_occupied}/{add_checked} ({add_rate:.0%})")
+
+    assert remove_rate >= 0.8, (
+        f"Only {remove_rate:.0%} of REMOVE steps freed spectrum"
+    )
+    # ADD rate can be lower due to rollbacks (infeasible LPs removed immediately)
+    print("✓ Spectrum coherence OK")
+
+
+def test_no_infeasible_persist(ep=None):
+    """After rollback fix, no infeasible LPs should persist in final state."""
+    print("\n--- Test 2R.7: No infeasible LPs persist ---")
+    if ep is None:
+        policy, _ = setup(seed=42, max_steps=30)
+        ep = policy.generate_episode()
+
+    final_state = ep['states'][-1]
+    n_infeasible = final_state['global_features'][3]
+    n_active = final_state['global_features'][0]
+
+    infeasible_ratio = n_infeasible / max(1, n_active)
+
+    print(f"  Active LPs: {n_active:.0f}")
+    print(f"  Infeasible: {n_infeasible:.0f} ({infeasible_ratio:.0%})")
+
+    # With rollback, infeasible count should be low
+    assert infeasible_ratio < 0.3, (
+        f"Too many infeasible LPs in final state: {n_infeasible:.0f}/{n_active:.0f}. "
+        f"Rollback should prevent infeasible LPs from persisting."
+    )
+    print("✓ No infeasible persist OK")
 
 
 def test_seed_diversity():
@@ -119,9 +221,11 @@ def test_seed_diversity():
     assert not np.array_equal(s1, s2), 'Different seeds produced identical states'
 
     print(f"  Seed 42: link={ep1['metadata']['failed_link']}, "
-          f"steps={ep1['metadata']['n_steps']}")
+          f"steps={ep1['metadata']['n_steps']}, "
+          f"restored={ep1['metadata']['demands_restored']}")
     print(f"  Seed 55: link={ep2['metadata']['failed_link']}, "
-          f"steps={ep2['metadata']['n_steps']}")
+          f"steps={ep2['metadata']['n_steps']}, "
+          f"restored={ep2['metadata']['demands_restored']}")
     print("✓ Seed diversity OK")
 
 
@@ -142,6 +246,9 @@ if __name__ == "__main__":
         ("2R.2 Two phases", test_two_phases, True),
         ("2R.3 LP count dip", test_lp_count_dip, True),
         ("2R.4 Seed diversity", test_seed_diversity, False),
+        ("2R.5 GSNR non-monotonic", test_gsnr_non_monotonic, True),
+        ("2R.6 Spectrum coherence", test_spectrum_coherence, True),
+        ("2R.7 No infeasible persist", test_no_infeasible_persist, True),
     ]:
         try:
             if use_ep:

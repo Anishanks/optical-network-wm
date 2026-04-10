@@ -170,6 +170,38 @@ class HDF5Writer:
             dtype=np.float32,
         )
 
+        # --- Outcomes (separated for probing/evaluation) ---
+        oc = ep.create_group("outcomes")
+
+        # Extract per-LP GSNR, margin, feasible from lp_features
+        # lp_features layout: [..., 17=gsnr, 18=margin, 19=feasible]
+        lp_feat_stack = np.stack([s["lp_features"] for s in states])
+        lp_mask_stack = np.stack([s["lp_mask"] for s in states])
+
+        oc.create_dataset(
+            "per_lp_gsnr",
+            data=lp_feat_stack[:, :, 17],  # [T, max_lp]
+            dtype=np.float32, **compress,
+        )
+        oc.create_dataset(
+            "per_lp_margin",
+            data=lp_feat_stack[:, :, 18],  # [T, max_lp]
+            dtype=np.float32, **compress,
+        )
+        oc.create_dataset(
+            "per_lp_feasible",
+            data=lp_feat_stack[:, :, 19] > 0.5,  # [T, max_lp]
+            dtype=bool, **compress,
+        )
+
+        # Total capacity per step (from global_features[1] = Tbps)
+        global_stack = np.stack([s["global_features"] for s in states])
+        oc.create_dataset(
+            "total_capacity_tbps",
+            data=global_stack[:, 1],  # [T]
+            dtype=np.float32,
+        )
+
     # -----------------------------------------------------------------
     # Split info
     # -----------------------------------------------------------------
@@ -282,5 +314,13 @@ class HDF5Reader:
             a_start = max(0, t_start)
             a_end = t_end - 1
             result["actions"] = ep["actions"][a_start:a_end]
+
+        # Outcomes (if available)
+        if "outcomes" in ep:
+            oc = ep["outcomes"]
+            result["per_lp_gsnr"] = oc["per_lp_gsnr"][t_start:t_end]
+            result["per_lp_margin"] = oc["per_lp_margin"][t_start:t_end]
+            result["per_lp_feasible"] = oc["per_lp_feasible"][t_start:t_end]
+            result["total_capacity_tbps"] = oc["total_capacity_tbps"][t_start:t_end]
 
         return result

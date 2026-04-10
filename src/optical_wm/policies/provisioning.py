@@ -41,7 +41,7 @@ class Demand:
 class ProvisioningConfig:
     """Configuration for the provisioning policy."""
     initial_load_frac: float = 0.2     # start at 20% load
-    target_load_frac: float = 0.7      # aim for 70% load
+    target_load_frac: float = 0.9      # aim for 90% load
     max_steps: int = 60                # maximum episode length
     n_demands: int = 50                # number of demands to generate
     k_shortest_paths: int = 3          # routing alternatives
@@ -207,10 +207,16 @@ class ProvisioningPolicy:
     # -----------------------------------------------------------------
 
     def _build_initial_load(self) -> List[LightpathDesc]:
-        """Create initial lightpaths to reach initial_load_frac."""
-        target_lps = int(MAX_SLOTS * self.config.initial_load_frac)
-        # Need at least 2 LPs for GNPy
-        target_lps = max(target_lps, 3)
+        """Create initial lightpaths to reach initial_load_frac.
+
+        The actual load fraction is jittered ±50% around the configured
+        value to diversify the starting conditions across episodes.
+        """
+        # Jitter initial load: e.g. 0.2 → uniform [0.10, 0.30]
+        base = self.config.initial_load_frac
+        jittered = self.rng.uniform(base * 0.5, base * 1.5)
+        target_lps = int(MAX_SLOTS * jittered)
+        target_lps = max(target_lps, 3)  # minimum for GNPy
 
         lightpaths = []
         lp_counter = 0
@@ -362,9 +368,15 @@ class ProvisioningPolicy:
     # Wavelength assignment
     # -----------------------------------------------------------------
 
-    def _first_fit_wavelength(self, route: List[str]) -> Optional[int]:
-        """Find first available wavelength slot on all links of the route."""
-        # Get link IDs along the route
+    def _first_fit_wavelength(self, route: List[str],
+                              top_k: int = 5) -> Optional[int]:
+        """Find an available wavelength slot on all links of the route.
+
+        Instead of strict first-fit (always slot 0, 1, 2, ...),
+        pick randomly among the first ``top_k`` free slots.
+        This diversifies spectral occupation patterns across episodes,
+        giving the world model richer input for learning NLI dynamics.
+        """
         link_ids = []
         for i in range(len(route) - 1):
             lid = self.link_lookup.get((route[i], route[i + 1]))
@@ -372,13 +384,18 @@ class ProvisioningPolicy:
                 return None
             link_ids.append(lid)
 
-        # Find first slot free on ALL links
+        # Collect free slots (up to top_k)
+        free_slots = []
         for slot in range(MAX_SLOTS):
             if all(slot not in self.wl_usage.get(lid, set())
                    for lid in link_ids):
-                return slot
+                free_slots.append(slot)
+                if len(free_slots) >= top_k:
+                    break
 
-        return None  # no free slot
+        if not free_slots:
+            return None
+        return int(self.rng.choice(free_slots))
 
     def _mark_wavelength(self, lp: LightpathDesc):
         """Mark wavelength as used on all links of the LP's route."""

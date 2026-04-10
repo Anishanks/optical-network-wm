@@ -20,7 +20,7 @@ from enum import IntEnum
 MAX_NODES = 20          # max nodes in any topology
 MAX_LINKS = 40          # max links (edges) in any topology
 MAX_SLOTS = 80          # wavelength slots per link (C-band, 50 GHz spacing)
-MAX_LIGHTPATHS = 80     # max simultaneous lightpaths
+MAX_LIGHTPATHS = 160     # max simultaneous lightpaths
 MAX_HOPS = 8            # max hops in a lightpath route
 
 # Feature dimensions

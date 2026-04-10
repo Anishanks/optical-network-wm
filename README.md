@@ -35,10 +35,9 @@ python tests/test_level0_schemas.py
 ### Level 1 — Run inside GNPy Docker
 
 ```bash
-docker run -it --rm -v "C:\optical-network-wm:/work" telecominfraproject/oopt-gnpy
+docker run -it --rm -v "C:\Users\anb51\OneDrive - NIST\Desktop\Digital Twin AGI\optical-network-wm:/work" telecominfraproject/oopt-gnpy
 cd /work
-pip install h5py networkx
-pip install -e .
+pip install h5py networkx -q && pip install -e . -q
 python tests/test_level1_gnpy.py
 ```
 
@@ -47,6 +46,19 @@ python tests/test_level1_gnpy.py
 ```bash
 python tests/test_level2_provisioning.py
 ```
+
+
+### Evaluate dataset
+
+# Rapport texte rapide (après smoke test)
+python -m optical_wm.evaluate_dataset --data data/ --report
+
+# Rapport + figures pour le papier (après full generation)
+python -m optical_wm.evaluate_dataset --data data/ --all --output figures/
+
+# Quick check sur un sous-ensemble
+python -m optical_wm.evaluate_dataset --data data/ --report --max-episodes 50
+
 
 ## Test Results
 
