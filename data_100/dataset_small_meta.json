@@ -1,0 +1,237 @@
+{
+  "config": {
+    "name": "small",
+    "max_steps": 60,
+    "val_frac": 0.1,
+    "topologies": [
+      {
+        "name": "topo_A_small_mesh",
+        "n_nodes": 8,
+        "connectivity": 0.4,
+        "split": "train"
+      },
+      {
+        "name": "topo_D_test",
+        "n_nodes": 10,
+        "connectivity": 0.35,
+        "split": "test"
+      }
+    ],
+    "per_topo_policy_mix": {
+      "provisioning": 15,
+      "margin_opt": 10,
+      "load_balance": 8,
+      "recovery": 10,
+      "mixed_ops": 7
+    }
+  },
+  "results": {
+    "total_episodes": 100,
+    "total_transitions": 5600,
+    "total_time_min": 6.435519401232401,
+    "total_warnings": 14
+  },
+  "per_topology": [
+    {
+      "topology": "topo_A_small_mesh",
+      "split": "train",
+      "n_nodes": 8,
+      "n_links": 11,
+      "episodes": 50,
+      "transitions": 2812,
+      "time_s": 183.45305919647217,
+      "policy_stats": {
+        "provisioning": {
+          "count": 15,
+          "total_steps": 900,
+          "action_types": {
+            "ADD": 900
+          }
+        },
+        "margin_opt": {
+          "count": 10,
+          "total_steps": 600,
+          "action_types": {
+            "REROUTE": 54,
+            "MOD_CHANGE": 119,
+            "POWER_ADJUST": 427
+          }
+        },
+        "load_balance": {
+          "count": 8,
+          "total_steps": 480,
+          "action_types": {
+            "REROUTE": 480
+          }
+        },
+        "recovery": {
+          "count": 10,
+          "total_steps": 412,
+          "action_types": {
+            "REMOVE": 206,
+            "ADD": 206
+          }
+        },
+        "mixed_ops": {
+          "count": 7,
+          "total_steps": 420,
+          "action_types": {
+            "ADD": 216,
+            "POWER_ADJUST": 75,
+            "MOD_CHANGE": 27,
+            "REROUTE": 19,
+            "REMOVE": 83
+          }
+        }
+      },
+      "n_warnings": 4,
+      "warnings": [
+        "ep_00045_mixed_ops step 13: margin=7.96 != gsnr(23.46)-threshold(8.5)=14.96",
+        "ep_00045_mixed_ops step 19: margin=7.96 != gsnr(23.46)-threshold(8.5)=14.96",
+        "ep_00045_mixed_ops step 26: margin=7.51 != gsnr(23.01)-threshold(8.5)=14.51",
+        "ep_00045_mixed_ops: 4 steps with physics warnings (showing 3)"
+      ],
+      "h5_path": "data_100/topo_A_small_mesh.h5"
+    },
+    {
+      "topology": "topo_D_test",
+      "split": "test",
+      "n_nodes": 10,
+      "n_links": 15,
+      "episodes": 50,
+      "transitions": 2788,
+      "time_s": 202.44771194458008,
+      "policy_stats": {
+        "provisioning": {
+          "count": 15,
+          "total_steps": 900,
+          "action_types": {
+            "ADD": 900
+          }
+        },
+        "margin_opt": {
+          "count": 10,
+          "total_steps": 600,
+          "action_types": {
+            "REROUTE": 80,
+            "MOD_CHANGE": 128,
+            "POWER_ADJUST": 392
+          }
+        },
+        "load_balance": {
+          "count": 8,
+          "total_steps": 480,
+          "action_types": {
+            "REROUTE": 480
+          }
+        },
+        "recovery": {
+          "count": 10,
+          "total_steps": 388,
+          "action_types": {
+            "REMOVE": 194,
+            "ADD": 194
+          }
+        },
+        "mixed_ops": {
+          "count": 7,
+          "total_steps": 420,
+          "action_types": {
+            "ADD": 222,
+            "POWER_ADJUST": 63,
+            "REMOVE": 92,
+            "REROUTE": 17,
+            "MOD_CHANGE": 26
+          }
+        }
+      },
+      "n_warnings": 10,
+      "warnings": [
+        "ep_00046_mixed_ops step 13: margin=12.21 != gsnr(20.71)-threshold(15.5)=5.21",
+        "ep_00046_mixed_ops step 19: margin=12.21 != gsnr(20.71)-threshold(15.5)=5.21",
+        "ep_00046_mixed_ops step 26: margin=12.21 != gsnr(20.71)-threshold(15.5)=5.21",
+        "ep_00048_mixed_ops step 6: margin=12.72 != gsnr(21.22)-threshold(15.5)=5.72",
+        "ep_00048_mixed_ops step 13: margin=11.64 != gsnr(20.14)-threshold(15.5)=4.64",
+        "ep_00048_mixed_ops step 19: margin=12.41 != gsnr(20.91)-threshold(15.5)=5.41",
+        "ep_00048_mixed_ops: 9 steps with physics warnings (showing 3)",
+        "ep_00049_mixed_ops step 19: margin=11.80 != gsnr(20.30)-threshold(15.5)=4.80",
+        "ep_00049_mixed_ops step 26: margin=11.80 != gsnr(20.30)-threshold(15.5)=4.80",
+        "ep_00049_mixed_ops step 32: margin=11.79 != gsnr(20.29)-threshold(15.5)=4.79"
+      ],
+      "h5_path": "data_100/topo_D_test.h5"
+    }
+  ],
+  "validation": [
+    {
+      "topology": "topo_A_small_mesh",
+      "n_episodes": 50,
+      "policy_distribution": {
+        "provisioning": 15,
+        "margin_optimization": 10,
+        "load_balancing": 8,
+        "recovery": 10,
+        "mixed_ops": 7
+      },
+      "gsnr_min": 13.615829467773438,
+      "gsnr_max": 26.94980239868164,
+      "gsnr_mean": 19.516555989891852,
+      "gsnr_std": 2.6125262898820734,
+      "action_distribution": {
+        "ADD": 104,
+        "REROUTE": 44,
+        "MOD_CHANGE": 14,
+        "POWER_ADJUST": 36,
+        "REMOVE": 52
+      },
+      "coupling_pct": 100.0,
+      "coupling_tested": 104
+    },
+    {
+      "topology": "topo_D_test",
+      "n_episodes": 50,
+      "policy_distribution": {
+        "provisioning": 15,
+        "margin_optimization": 10,
+        "load_balancing": 8,
+        "recovery": 10,
+        "mixed_ops": 7
+      },
+      "gsnr_min": 11.336777687072754,
+      "gsnr_max": 26.981355667114258,
+      "gsnr_mean": 18.480770379452217,
+      "gsnr_std": 2.8273493640084153,
+      "action_distribution": {
+        "ADD": 107,
+        "REROUTE": 47,
+        "MOD_CHANGE": 9,
+        "POWER_ADJUST": 35,
+        "REMOVE": 52
+      },
+      "coupling_pct": 100.0,
+      "coupling_tested": 107
+    }
+  ],
+  "action_distribution": {
+    "ADD": 2638,
+    "REROUTE": 1130,
+    "MOD_CHANGE": 300,
+    "POWER_ADJUST": 957,
+    "REMOVE": 575
+  },
+  "evaluation_spec": {
+    "probing_targets": [
+      "n_active_lightpaths",
+      "total_capacity_tbps",
+      "worst_margin_db",
+      "avg_margin_db",
+      "spectral_utilization"
+    ],
+    "planning_horizons": [
+      10,
+      25,
+      50
+    ],
+    "planning_budget": 50,
+    "goal_sampling": "same episode, t+k steps ahead"
+  }
+}
