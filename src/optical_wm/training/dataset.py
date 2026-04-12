@@ -91,7 +91,9 @@ class OpticalWMDataset(Dataset):
             for eid in ep_list:
                 info = reader.get_episode_info(eid)
                 n_steps = info['n_steps']
-                # Sub-trajectories: need context_length states + (context_length-1) actions
+                # Skip episodes shorter than context_length
+                if n_steps < context_length:
+                    continue
                 max_start = n_steps - context_length
                 for t in range(max(1, max_start)):
                     self.index.append((reader_idx, eid, t))

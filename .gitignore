@@ -10,3 +10,11 @@ data/*.json
 .idea/
 .vscode/
 *.tar.gz
+
+checkpoints/
+data_*/
+figures/
+*.pt
+*.h5
+
+figures_*/
