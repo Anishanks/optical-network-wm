@@ -55,7 +55,7 @@ class Trainer:
 
         # LR Schedule: cosine with warmup
         self.total_steps = len(train_loader) * config.n_epochs
-        self.warmup_steps = len(train_loader) * config.warmup_epochs
+        self.warmup_steps = min(1000, len(train_loader))
 
         # Logging
         self.output_dir = Path(config.output_dir) / config.run_name
