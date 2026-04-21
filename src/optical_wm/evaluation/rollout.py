@@ -208,70 +208,75 @@ def compute_rollout_metrics(
 
 
 # =====================================================================
-# Baselines: linear-AR and persistence in latent space
+# Baselines: linear-AR (1-step stable) and persistence in latent space
 # =====================================================================
 
-def fit_linear_direct(episodes: List[Dict], max_horizon: int,
-                      ridge: float = 1e-3) -> Dict[int, torch.Tensor]:
+def fit_linear_1step(episodes: List[Dict], ridge: float = 1.0) -> torch.Tensor:
     """
-    Direct multi-step linear fit. For each horizon k, train a separate
-    predictor z_{t+k} = [z_t | a_{t:t+k-1} | 1] @ W_k.
+    Fit a 1-step linear AR: z_{t+1} = [z_t | a_t | 1] @ W
+    with strong ridge regularization (default 1.0).
 
-    This avoids the autoregressive explosion of a compounded 1-step model:
-    the fit is a ceiling for what a linear map can do at horizon k given
-    the initial embedding and the full action sequence.
-
-    Returns:
-        {k: W_k of shape [D + k*A + 1, D]}
+    Returns W: [D + A + 1, D]
     """
-    Ws: Dict[int, torch.Tensor] = {}
-    for k in range(1, max_horizon + 1):
-        X_list, Y_list = [], []
-        for ep in episodes:
-            z = ep['z_real']      # [T, D]
-            a = ep['actions']     # [T-1, A]
-            T = z.shape[0]
-            if T <= k:
-                continue
-            for t in range(T - k):
-                X_list.append(torch.cat([z[t], a[t:t + k].reshape(-1)], dim=-1))
-                Y_list.append(z[t + k])
-        if not X_list:
-            continue
-        X = torch.stack(X_list, dim=0)
-        Y = torch.stack(Y_list, dim=0)
-        ones = torch.ones(X.shape[0], 1, dtype=X.dtype)
-        X = torch.cat([X, ones], dim=-1)
-        XTX = X.T @ X
-        reg = ridge * torch.eye(XTX.shape[0], dtype=XTX.dtype)
-        Ws[k] = torch.linalg.solve(XTX + reg, X.T @ Y)
-    return Ws
+    X_list, Y_list = [], []
+    for ep in episodes:
+        z = ep['z_real']   # [T, D]
+        a = ep['actions']  # [T-1, A]
+        T = z.shape[0]
+        for t in range(T - 1):
+            X_list.append(torch.cat([z[t], a[t], torch.ones(1, dtype=z.dtype)], dim=-1))
+            Y_list.append(z[t + 1])
+    X = torch.stack(X_list)  # [N, D+A+1]
+    Y = torch.stack(Y_list)  # [N, D]
+    XTX = X.T @ X
+    reg = ridge * torch.eye(XTX.shape[0], dtype=XTX.dtype)
+    return torch.linalg.solve(XTX + reg, X.T @ Y)  # [D+A+1, D]
 
 
-def predict_linear_direct(W_k: torch.Tensor, z_0: torch.Tensor,
-                          actions_k: torch.Tensor) -> torch.Tensor:
+def rollout_linear_1step(
+    W: torch.Tensor, z_0: torch.Tensor, actions: torch.Tensor,
+    max_sv: float = 0.99,
+) -> torch.Tensor:
     """
+    Stable autoregressive rollout using 1-step linear model.
+    Clips singular values of the state transition matrix to ≤ max_sv
+    so the dynamics cannot explode over many steps.
+
     Args:
-        W_k:       [D + k*A + 1, D]
-        z_0:       [D]
-        actions_k: [k, A]
+        W:       [D+A+1, D]  — fitted weight matrix
+        z_0:     [D]
+        actions: [H, A]
+        max_sv:  singular-value ceiling (0.99 ≈ mild decay per step)
     Returns:
-        z_hat_k:   [D]
+        z_pred:  [H+1, D]   (index 0 = z_0)
     """
-    x = torch.cat([z_0, actions_k.reshape(-1), torch.ones(1, dtype=z_0.dtype)], dim=-1)
-    return x @ W_k
+    D = z_0.shape[0]
+    W_A = W[:D]    # [D, D] — state-to-state part
+    W_B = W[D:-1]  # [A, D] — action-to-state part
+    c   = W[-1]    # [D]    — bias
+
+    # Clip singular values of W_A to prevent amplification
+    U, S, Vh = torch.linalg.svd(W_A)
+    W_A_stable = U @ torch.diag(S.clamp(max=max_sv)) @ Vh
+
+    z_preds = [z_0]
+    z = z_0.clone()
+    for t in range(actions.shape[0]):
+        z = z @ W_A_stable + actions[t] @ W_B + c
+        z_preds.append(z)
+    return torch.stack(z_preds)  # [H+1, D]
 
 
 def compute_baseline_rollouts(
-    episodes: List[Dict], Ws: Dict[int, torch.Tensor], max_horizon: int
+    episodes: List[Dict], W: torch.Tensor, max_horizon: int
 ) -> Dict[str, Dict[int, float]]:
     """
-    Evaluate direct-linear and persistence baselines on val windows.
+    Evaluate the stable 1-step AR and the persistence baselines on val windows.
 
     Returns:
         {
-            'linear_direct': {k: mean_mse},
-            'persistence':   {k: mean_mse},
+            'linear_ar': {k: mean_mse},
+            'persistence': {k: mean_mse},
         }
     """
     per_h_lin = defaultdict(list)
@@ -285,16 +290,14 @@ def compute_baseline_rollouts(
         if H < 1:
             continue
         z_0 = z_real[0]
+        z_pred = rollout_linear_1step(W, z_0, actions[:H])  # [H+1, D]
         for k in range(1, H + 1):
-            if k not in Ws:
-                continue
-            z_hat = predict_linear_direct(Ws[k], z_0, actions[:k])
-            per_h_lin[k].append(F.mse_loss(z_hat, z_real[k]).item())
+            per_h_lin[k].append(F.mse_loss(z_pred[k], z_real[k]).item())
             per_h_pers[k].append(F.mse_loss(z_0, z_real[k]).item())
 
     return {
-        'linear_direct': {h: float(np.mean(v)) for h, v in sorted(per_h_lin.items())},
-        'persistence':   {h: float(np.mean(v)) for h, v in sorted(per_h_pers.items())},
+        'linear_ar':   {h: float(np.mean(v)) for h, v in sorted(per_h_lin.items())},
+        'persistence': {h: float(np.mean(v)) for h, v in sorted(per_h_pers.items())},
     }
 
 
@@ -460,12 +463,12 @@ def generate_report(
             alpha=0.15, color='#065A82',
         )
         if baseline_metrics:
-            lin = baseline_metrics.get('linear_direct', {})
+            lin = baseline_metrics.get('linear_ar', {})
             pers = baseline_metrics.get('persistence', {})
             if lin:
                 hs = sorted(lin.keys())
                 ax.plot(hs, [lin[h] for h in hs], 's-', color='#D97706',
-                        linewidth=2, markersize=4, label='Linear (direct k)')
+                        linewidth=2, markersize=4, label='Linear AR (1-step, stable)')
             if pers:
                 hs = sorted(pers.keys())
                 ax.plot(hs, [pers[h] for h in hs], '^--', color='#6B7280',
@@ -624,19 +627,19 @@ def main():
         model, episodes, max_horizon=args.max_horizon, device=args.device
     )
 
-    # Fit direct-linear on train embeddings, evaluate baselines on val windows
-    print(f"\n  Fitting direct-linear baselines (per horizon) on "
+    # Fit 1-step linear AR on train embeddings, evaluate baselines on val windows
+    print(f"\n  Fitting stable 1-step linear AR baseline on "
           f"{len(train_episodes)} train windows...")
-    Ws = fit_linear_direct(train_episodes, max_horizon=args.max_horizon)
+    W = fit_linear_1step(train_episodes, ridge=1.0)
     baseline_metrics = compute_baseline_rollouts(
-        episodes, Ws, max_horizon=args.max_horizon
+        episodes, W, max_horizon=args.max_horizon
     )
 
     # Print summary
     print(f"\n  ── MSE per Horizon ──")
-    print(f"  {'h':>4} {'JEPA':>10} {'linear-dir':>11} {'persist':>10} {'ratio J/L':>10}")
-    print(f"  {'-'*4} {'-'*10} {'-'*11} {'-'*10} {'-'*10}")
-    lin = baseline_metrics['linear_direct']
+    print(f"  {'h':>4} {'JEPA':>10} {'linear-AR':>10} {'persist':>10} {'ratio J/L':>10}")
+    print(f"  {'-'*4} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+    lin = baseline_metrics['linear_ar']
     pers = baseline_metrics['persistence']
     for h in sorted(rollout_metrics['mse_per_horizon'].keys()):
         mse = rollout_metrics['mse_per_horizon'][h]

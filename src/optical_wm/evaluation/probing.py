@@ -95,7 +95,7 @@ def extract_pairs(
         where y = global_features at (anchor + k).
     """
     model.eval()
-    per_k = {k: {'z': [], 'gf': [], 'pooled': [], 'y': []} for k in horizons}
+    per_k = {k: {'z': [], 'gf': [], 'pooled': [], 'y': [], 'y_delta': []} for k in horizons}
     max_k = max(horizons)
 
     for i, batch in enumerate(data_loader):
@@ -150,6 +150,7 @@ def extract_pairs(
                 per_k[k]['gf'].append(gf_all[:, t])
                 per_k[k]['pooled'].append(pooled_per_t[t])
                 per_k[k]['y'].append(gf_all[:, t + k])
+                per_k[k]['y_delta'].append(gf_all[:, t + k] - gf_all[:, t])
 
     # Cat
     out = {}
@@ -259,44 +260,38 @@ def run_predictive_probing(
             f"(train N={td['z'].shape[0]}, val N={vd['z'].shape[0]}, "
             f"z_dim={td['z'].shape[1]}) ==="
         )
+        print(f"  Target: Δy = gf[t+k] - gf[t]  (normalized internally by σ(Δy_train))")
         print(
             f"  {'Target':<20} {'Model':<12} {'Probe':<6} "
-            f"{'MSE':>9} {'r':>7} {'R2':>7}"
+            f"{'MSE(Δ)':>9} {'r(Δ)':>7} {'R2(Δ)':>7}"
         )
         print(f"  {'-'*20} {'-'*12} {'-'*6} {'-'*9} {'-'*7} {'-'*7}")
 
         results[k] = {}
         for target_key, info in PROBE_TARGETS.items():
             idx = info['idx']
-            y_train = td['y'][:, idx]
-            y_val = vd['y'][:, idx]
+            # Delta targets: Δy = gf[t+k] - gf[t]
+            y_train = td['y_delta'][:, idx]
+            y_val   = vd['y_delta'][:, idx]
             if y_train.std() < 1e-6 or y_val.std() < 1e-6:
-                print(f"  {target_key:<20} SKIPPED (no variance in y)")
+                print(f"  {target_key:<20} SKIPPED (no variance in Δy — target is static)")
                 continue
 
             results[k][target_key] = {}
 
-            # Persistence baseline: predict gf[t+k][idx] = gf[t][idx]
-            persist_pred = vd['gf'][:, idx]
-            persist_mse = ((persist_pred - y_val) ** 2).mean().item()
-            if persist_pred.std() > 1e-8 and y_val.std() > 1e-8:
-                persist_r = float(np.corrcoef(
-                    persist_pred.numpy(), y_val.numpy()
-                )[0, 1])
-            else:
-                persist_r = 0.0
-            ss_res = ((persist_pred - y_val) ** 2).sum().item()
+            # Persistence baseline: predicts Δy = 0 (no change), always r = 0
+            persist_mse = (y_val ** 2).mean().item()   # MSE of predicting 0
             ss_tot = ((y_val - y_val.mean()) ** 2).sum().item()
-            persist_r2 = 1 - ss_res / max(ss_tot, 1e-8)
+            persist_r2 = 1.0 - (y_val ** 2).sum().item() / max(ss_tot, 1e-8)
             results[k][target_key]['persistence'] = {
-                'mse': persist_mse, 'pearson_r': persist_r, 'r_squared': persist_r2,
+                'mse': persist_mse, 'pearson_r': 0.0, 'r_squared': persist_r2,
             }
             print(
-                f"  {target_key:<20} {'persist':<12} {'-':<6} "
-                f"{persist_mse:>9.4f} {persist_r:>7.3f} {persist_r2:>7.3f}"
+                f"  {target_key:<20} {'persist(Δ=0)':<12} {'-':<6} "
+                f"{persist_mse:>9.4f} {0.0:>7.3f} {persist_r2:>7.3f}"
             )
 
-            # Trained probes
+            # Trained probes (predict Δy from inputs at time t)
             for input_name, input_key in INPUT_KEYS:
                 X_train = td[input_key]
                 X_val = vd[input_key]
@@ -330,10 +325,12 @@ def run_predictive_probing(
         )
 
     print(
-        "\n  Interpretation:\n"
-        "    jepa > gf_ar  -> z_t encodes dynamics beyond the current aggregate state.\n"
-        "    jepa ~ gf_ar  -> z_t preserves info but adds no predictive value.\n"
-        "    jepa < gf_ar  -> encoder is losing information relevant to the target."
+        "\n  Interpretation (delta targets — persistence always r=0):\n"
+        "    jepa > gf_ar  -> z_t encodes future *changes* beyond knowing the current state.\n"
+        "    jepa ~ gf_ar  -> z_t captures dynamics but adds nothing over raw gf.\n"
+        "    jepa < gf_ar  -> encoder discards dynamic information present in raw gf.\n"
+        "    r > 0.3       -> meaningful predictive signal in the representation.\n"
+        "    r ~ 0         -> representation carries no information about future changes."
     )
     return results
 
@@ -380,7 +377,7 @@ def generate_report(results: Dict, output_dir: str):
         ax.plot(horizons, ys, marker=marker, linestyle=ls, color=color, label=label)
     ax.set_xlabel('Horizon k (steps)')
     ax.set_ylabel('Avg Pearson r (across targets)')
-    ax.set_title('Predictive probing: gf[t+k] from inputs at t')
+    ax.set_title('Predictive probing: Δgf[t→t+k] from inputs at t')
     ax.set_ylim(-0.05, 1.05)
     ax.legend(fontsize=9)
     ax.spines['top'].set_visible(False)
@@ -401,7 +398,7 @@ def generate_report(results: Dict, output_dir: str):
                   for t in targets]
             ax.bar(x + off * width, ys, width, label=label, color=color)
         ax.set_ylabel('Pearson r')
-        ax.set_title(f'Predictive probing at horizon k={k}')
+        ax.set_title(f'Predictive probing Δgf at horizon k={k}')
         ax.set_xticks(x)
         ax.set_xticklabels([PROBE_TARGETS[t]['name'] for t in targets],
                            rotation=25, ha='right', fontsize=9)
