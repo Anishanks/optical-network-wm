@@ -208,6 +208,97 @@ def compute_rollout_metrics(
 
 
 # =====================================================================
+# Baselines: linear-AR and persistence in latent space
+# =====================================================================
+
+def fit_linear_direct(episodes: List[Dict], max_horizon: int,
+                      ridge: float = 1e-3) -> Dict[int, torch.Tensor]:
+    """
+    Direct multi-step linear fit. For each horizon k, train a separate
+    predictor z_{t+k} = [z_t | a_{t:t+k-1} | 1] @ W_k.
+
+    This avoids the autoregressive explosion of a compounded 1-step model:
+    the fit is a ceiling for what a linear map can do at horizon k given
+    the initial embedding and the full action sequence.
+
+    Returns:
+        {k: W_k of shape [D + k*A + 1, D]}
+    """
+    Ws: Dict[int, torch.Tensor] = {}
+    for k in range(1, max_horizon + 1):
+        X_list, Y_list = [], []
+        for ep in episodes:
+            z = ep['z_real']      # [T, D]
+            a = ep['actions']     # [T-1, A]
+            T = z.shape[0]
+            if T <= k:
+                continue
+            for t in range(T - k):
+                X_list.append(torch.cat([z[t], a[t:t + k].reshape(-1)], dim=-1))
+                Y_list.append(z[t + k])
+        if not X_list:
+            continue
+        X = torch.stack(X_list, dim=0)
+        Y = torch.stack(Y_list, dim=0)
+        ones = torch.ones(X.shape[0], 1, dtype=X.dtype)
+        X = torch.cat([X, ones], dim=-1)
+        XTX = X.T @ X
+        reg = ridge * torch.eye(XTX.shape[0], dtype=XTX.dtype)
+        Ws[k] = torch.linalg.solve(XTX + reg, X.T @ Y)
+    return Ws
+
+
+def predict_linear_direct(W_k: torch.Tensor, z_0: torch.Tensor,
+                          actions_k: torch.Tensor) -> torch.Tensor:
+    """
+    Args:
+        W_k:       [D + k*A + 1, D]
+        z_0:       [D]
+        actions_k: [k, A]
+    Returns:
+        z_hat_k:   [D]
+    """
+    x = torch.cat([z_0, actions_k.reshape(-1), torch.ones(1, dtype=z_0.dtype)], dim=-1)
+    return x @ W_k
+
+
+def compute_baseline_rollouts(
+    episodes: List[Dict], Ws: Dict[int, torch.Tensor], max_horizon: int
+) -> Dict[str, Dict[int, float]]:
+    """
+    Evaluate direct-linear and persistence baselines on val windows.
+
+    Returns:
+        {
+            'linear_direct': {k: mean_mse},
+            'persistence':   {k: mean_mse},
+        }
+    """
+    per_h_lin = defaultdict(list)
+    per_h_pers = defaultdict(list)
+
+    for ep in episodes:
+        z_real = ep['z_real']
+        actions = ep['actions']
+        T = z_real.shape[0]
+        H = min(max_horizon, T - 1)
+        if H < 1:
+            continue
+        z_0 = z_real[0]
+        for k in range(1, H + 1):
+            if k not in Ws:
+                continue
+            z_hat = predict_linear_direct(Ws[k], z_0, actions[:k])
+            per_h_lin[k].append(F.mse_loss(z_hat, z_real[k]).item())
+            per_h_pers[k].append(F.mse_loss(z_0, z_real[k]).item())
+
+    return {
+        'linear_direct': {h: float(np.mean(v)) for h, v in sorted(per_h_lin.items())},
+        'persistence':   {h: float(np.mean(v)) for h, v in sorted(per_h_pers.items())},
+    }
+
+
+# =====================================================================
 # Probing on predicted embeddings
 # =====================================================================
 
@@ -324,6 +415,7 @@ def generate_report(
     rollout_metrics: Dict,
     probing_results: Dict = None,
     output_dir: str = "figures/rollout",
+    baseline_metrics: Dict = None,
 ):
     """Save results and generate plots."""
     os.makedirs(output_dir, exist_ok=True)
@@ -336,6 +428,8 @@ def generate_report(
             'n_episodes': rollout_metrics['n_episodes'],
         },
     }
+    if baseline_metrics:
+        report['baselines'] = baseline_metrics
     if probing_results:
         report['probing_vs_horizon'] = {
             str(h): v for h, v in probing_results.items()
@@ -365,6 +459,17 @@ def generate_report(
             [m + s for m, s in zip(mse_vals, std_vals)],
             alpha=0.15, color='#065A82',
         )
+        if baseline_metrics:
+            lin = baseline_metrics.get('linear_direct', {})
+            pers = baseline_metrics.get('persistence', {})
+            if lin:
+                hs = sorted(lin.keys())
+                ax.plot(hs, [lin[h] for h in hs], 's-', color='#D97706',
+                        linewidth=2, markersize=4, label='Linear (direct k)')
+            if pers:
+                hs = sorted(pers.keys())
+                ax.plot(hs, [pers[h] for h in hs], '^--', color='#6B7280',
+                        linewidth=2, markersize=4, label='Persistence')
         ax.set_xlabel('Prediction Horizon (steps)')
         ax.set_ylabel('MSE (latent space)')
         ax.set_title('Multi-Step Prediction Error vs Horizon')
@@ -435,7 +540,9 @@ def main():
     parser.add_argument('--probe-horizons', type=str, default='1,3,5,7',
                         help='Comma-separated horizons for probing')
     parser.add_argument('--max-episodes', type=int, default=None,
-                        help='Limit episodes for quick test')
+                        help='Limit val episodes for quick test')
+    parser.add_argument('--max-train-batches', type=int, default=None,
+                        help='Limit train batches used to fit linear-AR baseline')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--no-probing', action='store_true',
                         help='Skip probing on predictions')
@@ -486,7 +593,7 @@ def main():
     # Use longer context for rollout evaluation
     rollout_context = min(args.max_horizon + 1, 32)
 
-    _, val_loader = create_dataloaders(
+    train_loader, val_loader = create_dataloaders(
         data_dir=args.data,
         context_length=rollout_context,
         batch_size=args.batch_size,
@@ -499,7 +606,14 @@ def main():
     episodes = extract_episode_embeddings(
         model, val_loader, args.device, max_batches=max_batches
     )
-    print(f"  Extracted {len(episodes)} episode windows")
+    print(f"  Extracted {len(episodes)} val episode windows")
+
+    # Train episodes for linear-AR fit (separate pass, smaller cap)
+    train_cap = args.max_train_batches if hasattr(args, 'max_train_batches') else None
+    train_episodes = extract_episode_embeddings(
+        model, train_loader, args.device, max_batches=train_cap
+    )
+    print(f"  Extracted {len(train_episodes)} train episode windows for baseline fit")
 
     # ── Rollout metrics ──
     print(f"\n{'='*60}")
@@ -510,14 +624,26 @@ def main():
         model, episodes, max_horizon=args.max_horizon, device=args.device
     )
 
+    # Fit direct-linear on train embeddings, evaluate baselines on val windows
+    print(f"\n  Fitting direct-linear baselines (per horizon) on "
+          f"{len(train_episodes)} train windows...")
+    Ws = fit_linear_direct(train_episodes, max_horizon=args.max_horizon)
+    baseline_metrics = compute_baseline_rollouts(
+        episodes, Ws, max_horizon=args.max_horizon
+    )
+
     # Print summary
     print(f"\n  ── MSE per Horizon ──")
-    print(f"  {'Horizon':>8} {'MSE':>10} {'Std':>10}")
-    print(f"  {'-'*8} {'-'*10} {'-'*10}")
+    print(f"  {'h':>4} {'JEPA':>10} {'linear-dir':>11} {'persist':>10} {'ratio J/L':>10}")
+    print(f"  {'-'*4} {'-'*10} {'-'*11} {'-'*10} {'-'*10}")
+    lin = baseline_metrics['linear_direct']
+    pers = baseline_metrics['persistence']
     for h in sorted(rollout_metrics['mse_per_horizon'].keys()):
         mse = rollout_metrics['mse_per_horizon'][h]
-        std = rollout_metrics['std_per_horizon'][h]
-        print(f"  {h:>8} {mse:>10.6f} {std:>10.6f}")
+        l = lin.get(h, float('nan'))
+        p = pers.get(h, float('nan'))
+        ratio = mse / max(l, 1e-12) if l == l else float('nan')
+        print(f"  {h:>4} {mse:>10.5f} {l:>10.5f} {p:>10.5f} {ratio:>10.3f}")
 
     ratio = rollout_metrics['stability_ratio']
     h_max = rollout_metrics['h_max']
@@ -543,7 +669,8 @@ def main():
             )
 
     # ── Generate report ──
-    generate_report(rollout_metrics, probing_results, args.output)
+    generate_report(rollout_metrics, probing_results, args.output,
+                    baseline_metrics=baseline_metrics)
 
     print(f"\n{'='*60}")
     print(f"  Rollout evaluation complete")

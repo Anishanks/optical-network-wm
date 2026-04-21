@@ -1,33 +1,32 @@
 """
-Probing Evaluation (Éval 1) for Optical Network World Model.
+Predictive Probing Evaluation for Optical Network World Model.
 
-Evaluates whether the encoder's latent space captures physical quantities.
+Tests whether the encoder captures *dynamics*, not just information present
+in the current state.
 
 Protocol:
-  1. Load trained JEPA checkpoint
-  2. Freeze encoder (no gradients)
-  3. Encode all states in dataset → z vectors
-  4. Train small probes (linear / MLP) to predict physical quantities from z
-  5. Report MSE ↓ and Pearson r ↑
+  For each anchor timestep t and horizon k in {1, 3, 5, 7}:
+    target = global_features[t + k]
+    Compare how well different inputs at time t predict that target.
 
-Probing targets (from global_features):
-  - n_active_lightpaths    [0]
-  - total_capacity_tbps    [1]
-  - n_infeasible           [3]
-  - worst_margin_db        [4]
-  - avg_margin_db          [5]
-  - spectral_utilization   [6]
+Inputs compared (all evaluated at time t):
+  - jepa:   z_t = encoder(state_t)                 [D]
+  - gf_ar:  global_features_t                      [8]   (linear = AR baseline)
+  - pooled: raw spectral aggregates (no gf)        [4]   (mean/std GSNR, occ, power)
 
-Baselines:
-  - JEPA encoder (GNN)
-  - MLP encoder (ablation)
-  - Raw features (PCA to latent_dim)
-  - Random projection (sanity check)
+Reference baseline:
+  - persistence: predict gf[t+k][idx] = gf[t][idx]  (analytic, no training)
+
+Why this differs from the old protocol:
+  The previous version probed gf[t] from z_t, but gf[t] is part of the input
+  passed to the encoder -- a trivial encoder that preserves information gets
+  perfect scores. Predicting gf[t+k] forces the representation to encode
+  dynamics, not just copy the state.
 
 Usage:
-  python -m optical_wm.evaluation.probing \
-    --checkpoint checkpoints/smoke/best.pt \
-    --data data_100 \
+  PYTHONPATH=src py -m optical_wm.evaluation.probing \
+    --checkpoint checkpoints/run/best.pt \
+    --data data_500 \
     --output figures/probing
 """
 import torch
@@ -39,39 +38,31 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
-# =====================================================================
-# Probing targets
-# =====================================================================
 
 PROBE_TARGETS = {
-    'n_active_lps':        {'idx': 0, 'name': 'Active Lightpaths'},
-    'total_capacity':      {'idx': 1, 'name': 'Total Capacity (Tbps)'},
-    'n_infeasible':        {'idx': 3, 'name': 'Infeasible LPs'},
-    'worst_margin':        {'idx': 4, 'name': 'Worst Margin (dB)'},
-    'avg_margin':          {'idx': 5, 'name': 'Avg Margin (dB)'},
-    'spectral_util':       {'idx': 6, 'name': 'Spectral Utilization'},
+    'n_active_lps':   {'idx': 0, 'name': 'Active Lightpaths'},
+    'total_capacity': {'idx': 1, 'name': 'Total Capacity (Tbps)'},
+    'n_infeasible':   {'idx': 3, 'name': 'Infeasible LPs'},
+    'worst_margin':   {'idx': 4, 'name': 'Worst Margin (dB)'},
+    'avg_margin':     {'idx': 5, 'name': 'Avg Margin (dB)'},
+    'spectral_util':  {'idx': 6, 'name': 'Spectral Utilization'},
 }
 
+DEFAULT_HORIZONS = [1, 3, 5, 7]
 
-# =====================================================================
-# Probe models
-# =====================================================================
 
 class LinearProbe(nn.Module):
-    """Single linear layer: z → scalar."""
     def __init__(self, input_dim: int):
         super().__init__()
         self.linear = nn.Linear(input_dim, 1)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.linear(z).squeeze(-1)
+    def forward(self, x):
+        return self.linear(x).squeeze(-1)
 
 
 class MLPProbe(nn.Module):
-    """2-layer MLP: z → hidden → scalar."""
     def __init__(self, input_dim: int, hidden_dim: int = 64):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -80,448 +71,375 @@ class MLPProbe(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.mlp(z).squeeze(-1)
+    def forward(self, x):
+        return self.mlp(x).squeeze(-1)
 
 
-# =====================================================================
-# Extract embeddings from dataset
-# =====================================================================
+# ---------------------------------------------------------------
+# Extract (anchor, future) pairs
+# ---------------------------------------------------------------
 
 @torch.no_grad()
-def extract_embeddings(
+def extract_pairs(
     model,
     data_loader,
+    horizons: List[int],
     device: str = 'cpu',
     max_batches: int = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Dict[int, Dict[str, torch.Tensor]]:
     """
-    Extract encoder embeddings and corresponding global features.
+    For each horizon k, collect aligned samples.
 
     Returns:
-        embeddings: [N, latent_dim]
-        global_features: [N, n_global_features]
+        {k: {'z': [N,D], 'gf': [N,8], 'pooled': [N,4], 'y': [N,8]}}
+        where y = global_features at (anchor + k).
     """
     model.eval()
-    all_z = []
-    all_gf = []
+    per_k = {k: {'z': [], 'gf': [], 'pooled': [], 'y': []} for k in horizons}
+    max_k = max(horizons)
 
     for i, batch in enumerate(data_loader):
-        if max_batches and i >= max_batches:
+        if max_batches is not None and i >= max_batches:
             break
 
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                 for k, v in batch.items()}
-
-        # Remove actions (not needed for encoding)
-        actions = batch.pop('actions', None)
+        batch = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
+        batch.pop('actions', None)
 
         T = batch['global_features'].shape[1]
+        if T <= max_k:
+            continue
 
-        # Encode each timestep
+        # Encode every timestep in the window once
+        z_per_t: List[torch.Tensor] = []
+        pooled_per_t: List[torch.Tensor] = []
         for t in range(T):
             step_batch = {}
             for key, val in batch.items():
-                if val.dim() >= 2 and val.shape[1] == T:
+                if isinstance(val, torch.Tensor) and val.dim() >= 2 and val.shape[1] == T:
                     step_batch[key] = val[:, t]
                 else:
                     step_batch[key] = val
 
-            z_t = model.encoder(step_batch)  # [B, D]
-            gf_t = step_batch['global_features']  # [B, 8]
+            z_t = model.encoder(step_batch)
+            z_per_t.append(z_t.cpu())
 
-            all_z.append(z_t.cpu())
-            all_gf.append(gf_t.cpu())
+            # Raw spectral aggregates -- deliberately EXCLUDE global_features
+            gsnr = step_batch['channel_gsnr']   # [B, n_ch, ...]
+            occ = step_batch['spectral_occupancy'].float()
+            power = step_batch['channel_power']
+            dims = tuple(range(1, gsnr.dim()))
+            pooled_t = torch.stack([
+                gsnr.mean(dim=dims),
+                gsnr.std(dim=dims),
+                occ.mean(dim=dims),
+                power.mean(dim=dims),
+            ], dim=-1)
+            pooled_per_t.append(pooled_t.cpu())
 
-    embeddings = torch.cat(all_z, dim=0)       # [N, D]
-    global_feats = torch.cat(all_gf, dim=0)    # [N, 8]
+        gf_all = batch['global_features'].cpu()  # [B, T, 8]
 
-    return embeddings, global_feats
+        # Build per-horizon pairs
+        for t in range(T):
+            for k in horizons:
+                if t + k >= T:
+                    continue
+                per_k[k]['z'].append(z_per_t[t])
+                per_k[k]['gf'].append(gf_all[:, t])
+                per_k[k]['pooled'].append(pooled_per_t[t])
+                per_k[k]['y'].append(gf_all[:, t + k])
+
+    # Cat
+    out = {}
+    for k in horizons:
+        if not per_k[k]['z']:
+            continue
+        out[k] = {name: torch.cat(lst, dim=0) for name, lst in per_k[k].items()}
+    return out
 
 
-# =====================================================================
-# Train and evaluate a probe
-# =====================================================================
+# ---------------------------------------------------------------
+# Train a single probe
+# ---------------------------------------------------------------
 
 def train_probe(
     probe: nn.Module,
-    z_train: torch.Tensor,
+    x_train: torch.Tensor,
     y_train: torch.Tensor,
-    z_val: torch.Tensor,
+    x_val: torch.Tensor,
     y_val: torch.Tensor,
     lr: float = 1e-3,
     n_epochs: int = 100,
     batch_size: int = 256,
     device: str = 'cpu',
 ) -> Dict[str, float]:
-    """
-    Train a probe and return metrics.
-
-    Returns:
-        dict with 'mse', 'rmse', 'pearson_r', 'r_squared'
-    """
     probe = probe.to(device)
     optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
 
-    z_train = z_train.to(device)
+    x_train = x_train.to(device)
     y_train = y_train.to(device)
-    z_val = z_val.to(device)
+    x_val = x_val.to(device)
     y_val = y_val.to(device)
 
-    # Normalize targets for training stability
+    # Standardize inputs per-feature for numerical stability across probes
+    x_mean = x_train.mean(dim=0, keepdim=True)
+    x_std = x_train.std(dim=0, keepdim=True).clamp(min=1e-6)
+    x_train_n = (x_train - x_mean) / x_std
+    x_val_n = (x_val - x_mean) / x_std
+
     y_mean = y_train.mean()
     y_std = y_train.std().clamp(min=1e-6)
-    y_train_norm = (y_train - y_mean) / y_std
-    y_val_norm = (y_val - y_mean) / y_std
+    y_train_n = (y_train - y_mean) / y_std
 
-    N = len(z_train)
-
-    for epoch in range(n_epochs):
+    N = len(x_train_n)
+    for _ in range(n_epochs):
         probe.train()
-        # Mini-batch training
         perm = torch.randperm(N, device=device)
-        epoch_loss = 0
-        n_batches = 0
-
         for start in range(0, N, batch_size):
             idx = perm[start:start + batch_size]
-            z_batch = z_train[idx]
-            y_batch = y_train_norm[idx]
-
-            pred = probe(z_batch)
-            loss = F.mse_loss(pred, y_batch)
-
+            pred = probe(x_train_n[idx])
+            loss = F.mse_loss(pred, y_train_n[idx])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
-            n_batches += 1
-
-    # Evaluate on validation set
     probe.eval()
     with torch.no_grad():
-        pred_val = probe(z_val)
-        # Denormalize
-        pred_val_denorm = pred_val * y_std + y_mean
-        y_val_denorm = y_val
-
-        mse = F.mse_loss(pred_val_denorm, y_val_denorm).item()
-        rmse = mse ** 0.5
-
-        # Pearson correlation
-        pred_np = pred_val_denorm.cpu().numpy()
-        y_np = y_val_denorm.cpu().numpy()
-
+        pred = probe(x_val_n) * y_std + y_mean
+        mse = F.mse_loss(pred, y_val).item()
+        pred_np = pred.cpu().numpy()
+        y_np = y_val.cpu().numpy()
         if np.std(pred_np) > 1e-8 and np.std(y_np) > 1e-8:
-            pearson_r = float(np.corrcoef(pred_np, y_np)[0, 1])
+            r = float(np.corrcoef(pred_np, y_np)[0, 1])
         else:
-            pearson_r = 0.0
+            r = 0.0
+        ss_res = ((pred - y_val) ** 2).sum().item()
+        ss_tot = ((y_val - y_val.mean()) ** 2).sum().item()
+        r2 = 1 - ss_res / max(ss_tot, 1e-8)
 
-        # R²
-        ss_res = ((pred_val_denorm - y_val_denorm) ** 2).sum().item()
-        ss_tot = ((y_val_denorm - y_val_denorm.mean()) ** 2).sum().item()
-        r_squared = 1 - ss_res / max(ss_tot, 1e-8)
-
-    return {
-        'mse': mse,
-        'rmse': rmse,
-        'pearson_r': pearson_r,
-        'r_squared': r_squared,
-    }
+    return {'mse': mse, 'rmse': mse ** 0.5, 'pearson_r': r, 'r_squared': r2}
 
 
-# =====================================================================
-# Run full probing evaluation
-# =====================================================================
+# ---------------------------------------------------------------
+# Main evaluation loop
+# ---------------------------------------------------------------
 
-def run_probing(
+INPUT_KEYS = [
+    ('jepa',   'z'),       # learned encoder
+    ('gf_ar',  'gf'),      # linear probe on this = linear AR baseline
+    ('pooled', 'pooled'),  # raw spectral aggregates, no gf
+]
+
+
+def run_predictive_probing(
     model,
     train_loader,
     val_loader,
+    horizons: List[int] = DEFAULT_HORIZONS,
     device: str = 'cpu',
     n_probe_epochs: int = 100,
     max_extract_batches: int = None,
 ) -> Dict:
-    """
-    Run complete probing evaluation.
+    print(f"\n  Extracting (z_t, gf_{{t+k}}) pairs, horizons={horizons}...")
+    train_data = extract_pairs(model, train_loader, horizons, device, max_extract_batches)
+    val_data = extract_pairs(model, val_loader, horizons, device, max_extract_batches)
 
-    Returns dict with results per target per probe type.
-    """
-    print("\n  Extracting embeddings...")
-
-    # Extract train embeddings
-    z_train, gf_train = extract_embeddings(
-        model, train_loader, device, max_batches=max_extract_batches
-    )
-    print(f"    Train: {z_train.shape[0]} samples, z dim={z_train.shape[1]}")
-
-    # Extract val embeddings
-    z_val, gf_val = extract_embeddings(
-        model, val_loader, device, max_batches=max_extract_batches
-    )
-    print(f"    Val:   {z_val.shape[0]} samples, z dim={z_val.shape[1]}")
-
-    latent_dim = z_train.shape[1]
     results = {}
-
-    print(f"\n  Training probes (latent_dim={latent_dim})...")
-    print(f"  {'Target':<22} {'Probe':<8} {'MSE':>8} {'RMSE':>8} {'r':>8} {'R²':>8}")
-    print(f"  {'-'*22} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
-
-    for target_key, target_info in PROBE_TARGETS.items():
-        idx = target_info['idx']
-        y_train = gf_train[:, idx]
-        y_val = gf_val[:, idx]
-
-        # Skip targets with no variance
-        if y_train.std() < 1e-6:
-            print(f"  {target_key:<22} SKIPPED (no variance)")
+    for k in horizons:
+        if k not in train_data or k not in val_data:
+            print(f"  horizon k={k}: no samples (context too short), skipping")
             continue
 
-        results[target_key] = {}
+        td = train_data[k]
+        vd = val_data[k]
+        print(
+            f"\n  === Horizon k={k}  "
+            f"(train N={td['z'].shape[0]}, val N={vd['z'].shape[0]}, "
+            f"z_dim={td['z'].shape[1]}) ==="
+        )
+        print(
+            f"  {'Target':<20} {'Model':<12} {'Probe':<6} "
+            f"{'MSE':>9} {'r':>7} {'R2':>7}"
+        )
+        print(f"  {'-'*20} {'-'*12} {'-'*6} {'-'*9} {'-'*7} {'-'*7}")
 
-        for probe_name, probe_cls in [('linear', LinearProbe),
-                                       ('mlp', MLPProbe)]:
-            probe = probe_cls(latent_dim)
-            metrics = train_probe(
-                probe, z_train, y_train, z_val, y_val,
-                n_epochs=n_probe_epochs,
-                device=device,
-            )
-            results[target_key][probe_name] = metrics
+        results[k] = {}
+        for target_key, info in PROBE_TARGETS.items():
+            idx = info['idx']
+            y_train = td['y'][:, idx]
+            y_val = vd['y'][:, idx]
+            if y_train.std() < 1e-6 or y_val.std() < 1e-6:
+                print(f"  {target_key:<20} SKIPPED (no variance in y)")
+                continue
 
+            results[k][target_key] = {}
+
+            # Persistence baseline: predict gf[t+k][idx] = gf[t][idx]
+            persist_pred = vd['gf'][:, idx]
+            persist_mse = ((persist_pred - y_val) ** 2).mean().item()
+            if persist_pred.std() > 1e-8 and y_val.std() > 1e-8:
+                persist_r = float(np.corrcoef(
+                    persist_pred.numpy(), y_val.numpy()
+                )[0, 1])
+            else:
+                persist_r = 0.0
+            ss_res = ((persist_pred - y_val) ** 2).sum().item()
+            ss_tot = ((y_val - y_val.mean()) ** 2).sum().item()
+            persist_r2 = 1 - ss_res / max(ss_tot, 1e-8)
+            results[k][target_key]['persistence'] = {
+                'mse': persist_mse, 'pearson_r': persist_r, 'r_squared': persist_r2,
+            }
             print(
-                f"  {target_key:<22} {probe_name:<8} "
-                f"{metrics['mse']:>8.4f} {metrics['rmse']:>8.4f} "
-                f"{metrics['pearson_r']:>8.4f} {metrics['r_squared']:>8.4f}"
+                f"  {target_key:<20} {'persist':<12} {'-':<6} "
+                f"{persist_mse:>9.4f} {persist_r:>7.3f} {persist_r2:>7.3f}"
             )
 
-    # ── Summary ──
-    print(f"\n  ── Summary ──")
-    avg_r_linear = np.mean([
-        results[t]['linear']['pearson_r']
-        for t in results if 'linear' in results[t]
-    ])
-    avg_r_mlp = np.mean([
-        results[t]['mlp']['pearson_r']
-        for t in results if 'mlp' in results[t]
-    ])
-    print(f"  Avg Pearson r (linear): {avg_r_linear:.4f}")
-    print(f"  Avg Pearson r (MLP):    {avg_r_mlp:.4f}")
+            # Trained probes
+            for input_name, input_key in INPUT_KEYS:
+                X_train = td[input_key]
+                X_val = vd[input_key]
+                for probe_name, probe_cls in [('linear', LinearProbe),
+                                               ('mlp', MLPProbe)]:
+                    probe = probe_cls(X_train.shape[1])
+                    m = train_probe(
+                        probe, X_train, y_train, X_val, y_val,
+                        n_epochs=n_probe_epochs, device=device,
+                    )
+                    results[k][target_key][f'{input_name}_{probe_name}'] = m
+                    print(
+                        f"  {target_key:<20} {input_name:<12} {probe_name:<6} "
+                        f"{m['mse']:>9.4f} {m['pearson_r']:>7.3f} "
+                        f"{m['r_squared']:>7.3f}"
+                    )
 
-    if avg_r_linear > 0.9:
-        print(f"  ✅ Linear probes work well — physics is linearly accessible in z")
-    elif avg_r_mlp > 0.9:
-        print(f"  ⚠  Only MLP probes work — physics is encoded but non-linearly")
-    else:
-        print(f"  ✗  Probing fails — encoder may not capture physics")
+    # -- Summary: avg Pearson r for JEPA vs baselines --
+    print(f"\n  == Summary: avg Pearson r across targets ==")
+    print(f"  {'k':>3} {'persist':>9} {'gf_ar_lin':>11} {'pooled_lin':>11} "
+          f"{'jepa_lin':>11} {'jepa_mlp':>11}")
+    for k in sorted(results.keys()):
+        r_persist = _mean_over_targets(results[k], 'persistence', 'pearson_r')
+        r_gf_lin = _mean_over_targets(results[k], 'gf_ar_linear', 'pearson_r')
+        r_pooled_lin = _mean_over_targets(results[k], 'pooled_linear', 'pearson_r')
+        r_jepa_lin = _mean_over_targets(results[k], 'jepa_linear', 'pearson_r')
+        r_jepa_mlp = _mean_over_targets(results[k], 'jepa_mlp', 'pearson_r')
+        print(
+            f"  {k:>3} {r_persist:>9.3f} {r_gf_lin:>11.3f} "
+            f"{r_pooled_lin:>11.3f} {r_jepa_lin:>11.3f} {r_jepa_mlp:>11.3f}"
+        )
 
+    print(
+        "\n  Interpretation:\n"
+        "    jepa > gf_ar  -> z_t encodes dynamics beyond the current aggregate state.\n"
+        "    jepa ~ gf_ar  -> z_t preserves info but adds no predictive value.\n"
+        "    jepa < gf_ar  -> encoder is losing information relevant to the target."
+    )
     return results
 
 
-# =====================================================================
-# Baseline: probe on raw features (PCA compressed)
-# =====================================================================
-
-def run_raw_feature_baseline(
-    train_loader,
-    val_loader,
-    latent_dim: int = 128,
-    device: str = 'cpu',
-    n_probe_epochs: int = 100,
-    max_extract_batches: int = None,
-) -> Dict:
-    """
-    Baseline: apply PCA to raw features, then probe.
-    Shows whether the encoder adds value beyond dimensionality reduction.
-    """
-    print("\n  ── Raw Feature Baseline (PCA) ──")
-    print("  Extracting raw features...")
-
-    raw_train, gf_train = [], []
-    raw_val, gf_val = [], []
-
-    for loader, raw_list, gf_list in [
-        (train_loader, raw_train, gf_train),
-        (val_loader, raw_val, gf_val),
-    ]:
-        for i, batch in enumerate(loader):
-            if max_extract_batches and i >= max_extract_batches:
-                break
-            T = batch['global_features'].shape[1]
-            for t in range(T):
-                # Extract simple per-step features
-                gsnr_mean = batch['channel_gsnr'][:, t].mean(dim=-1).mean(dim=-1)  # [B]
-                gsnr_std = batch['channel_gsnr'][:, t].std(dim=-1).mean(dim=-1)
-                occ_mean = batch['spectral_occupancy'][:, t].float().mean(dim=-1).mean(dim=-1)
-                power_mean = batch['channel_power'][:, t].mean(dim=-1).mean(dim=-1)
-                gf = batch['global_features'][:, t]  # [B, 8]
-
-                # Stack simple features
-                feats = torch.stack([gsnr_mean, gsnr_std, occ_mean, power_mean], dim=-1)
-                feats = torch.cat([feats, gf], dim=-1)  # [B, 12]
-
-                raw_list.append(feats)
-                gf_list.append(gf)
-
-    raw_train = torch.cat(raw_train, dim=0)  # [N, 12]
-    gf_train = torch.cat(gf_train, dim=0)
-    raw_val = torch.cat(raw_val, dim=0)
-    gf_val = torch.cat(gf_val, dim=0)
-
-    print(f"    Train: {raw_train.shape[0]} samples, feat dim={raw_train.shape[1]}")
-
-    results = {}
-    feat_dim = raw_train.shape[1]
-
-    print(f"  {'Target':<22} {'Probe':<8} {'MSE':>8} {'RMSE':>8} {'r':>8} {'R²':>8}")
-    print(f"  {'-'*22} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
-
-    for target_key, target_info in PROBE_TARGETS.items():
-        idx = target_info['idx']
-        y_train = gf_train[:, idx]
-        y_val = gf_val[:, idx]
-
-        if y_train.std() < 1e-6:
-            continue
-
-        results[target_key] = {}
-
-        for probe_name, probe_cls in [('linear', LinearProbe),
-                                       ('mlp', MLPProbe)]:
-            probe = probe_cls(feat_dim)
-            metrics = train_probe(
-                probe, raw_train, y_train, raw_val, y_val,
-                n_epochs=n_probe_epochs,
-                device=device,
-            )
-            results[target_key][probe_name] = metrics
-
-            print(
-                f"  {target_key:<22} {probe_name:<8} "
-                f"{metrics['mse']:>8.4f} {metrics['rmse']:>8.4f} "
-                f"{metrics['pearson_r']:>8.4f} {metrics['r_squared']:>8.4f}"
-            )
-
-    return results
+def _mean_over_targets(k_results: Dict, key: str, metric: str) -> float:
+    vals = [v[key][metric] for v in k_results.values() if key in v]
+    return float(np.mean(vals)) if vals else float('nan')
 
 
-# =====================================================================
-# Generate comparison table and figures
-# =====================================================================
+# ---------------------------------------------------------------
+# Report / plots
+# ---------------------------------------------------------------
 
-def generate_report(
-    jepa_results: Dict,
-    baseline_results: Dict = None,
-    output_dir: str = "figures/probing",
-):
-    """Save results as JSON + optionally generate plots."""
+def generate_report(results: Dict, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
-
-    report = {'jepa': jepa_results}
-    if baseline_results:
-        report['raw_features'] = baseline_results
-
-    # Save JSON
     with open(f"{output_dir}/probing_results.json", 'w') as f:
-        json.dump(report, f, indent=2)
+        json.dump({str(k): v for k, v in results.items()}, f, indent=2)
     print(f"\n  Saved: {output_dir}/probing_results.json")
 
-    # Try to generate plots
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+    except ImportError:
+        print("  matplotlib not available -- skipping plots")
+        return
 
-        targets = list(jepa_results.keys())
-        if not targets:
-            return
+    horizons = sorted(results.keys())
+    if not horizons:
+        return
+    targets = list(next(iter(results.values())).keys())
 
-        # Bar chart: Pearson r comparison
+    # Plot 1: avg Pearson r vs horizon for each model
+    fig, ax = plt.subplots(figsize=(8, 5))
+    models = [
+        ('persistence',    'persistence',   '#6B7280', 'o', '--'),
+        ('gf_ar_linear',   'gf AR (lin)',   '#D97706', 's', '-'),
+        ('pooled_linear',  'pooled (lin)',  '#DC2626', '^', '-'),
+        ('jepa_linear',    'JEPA (lin)',    '#065A82', 'o', '-'),
+        ('jepa_mlp',       'JEPA (MLP)',    '#059669', 'D', '-'),
+    ]
+    for key, label, color, marker, ls in models:
+        ys = [_mean_over_targets(results[k], key, 'pearson_r') for k in horizons]
+        ax.plot(horizons, ys, marker=marker, linestyle=ls, color=color, label=label)
+    ax.set_xlabel('Horizon k (steps)')
+    ax.set_ylabel('Avg Pearson r (across targets)')
+    ax.set_title('Predictive probing: gf[t+k] from inputs at t')
+    ax.set_ylim(-0.05, 1.05)
+    ax.legend(fontsize=9)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(f"{output_dir}/probing_vs_horizon.png", dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {output_dir}/probing_vs_horizon.png")
+
+    # Plot 2: per-target Pearson r at k=1 and k=max
+    for k in [horizons[0], horizons[-1]]:
         fig, ax = plt.subplots(figsize=(10, 5))
         x = np.arange(len(targets))
-        width = 0.2
-
-        # JEPA linear
-        r_jepa_lin = [jepa_results[t]['linear']['pearson_r'] for t in targets]
-        ax.bar(x - 1.5*width, r_jepa_lin, width, label='JEPA (linear)',
-               color='#065A82')
-
-        # JEPA MLP
-        r_jepa_mlp = [jepa_results[t]['mlp']['pearson_r'] for t in targets]
-        ax.bar(x - 0.5*width, r_jepa_mlp, width, label='JEPA (MLP)',
-               color='#059669')
-
-        if baseline_results:
-            # Raw linear
-            r_raw_lin = [baseline_results.get(t, {}).get('linear', {}).get(
-                'pearson_r', 0) for t in targets]
-            ax.bar(x + 0.5*width, r_raw_lin, width,
-                   label='Raw features (linear)', color='#D97706')
-
-            # Raw MLP
-            r_raw_mlp = [baseline_results.get(t, {}).get('mlp', {}).get(
-                'pearson_r', 0) for t in targets]
-            ax.bar(x + 1.5*width, r_raw_mlp, width,
-                   label='Raw features (MLP)', color='#DC2626')
-
+        width = 0.15
+        offsets = [-2, -1, 0, 1, 2]
+        for (key, label, color, _, _), off in zip(models, offsets):
+            ys = [results[k].get(t, {}).get(key, {}).get('pearson_r', 0)
+                  for t in targets]
+            ax.bar(x + off * width, ys, width, label=label, color=color)
         ax.set_ylabel('Pearson r')
-        ax.set_title('Probing: Physical Quantity Recovery from Latent Space')
+        ax.set_title(f'Predictive probing at horizon k={k}')
         ax.set_xticks(x)
         ax.set_xticklabels([PROBE_TARGETS[t]['name'] for t in targets],
                            rotation=25, ha='right', fontsize=9)
-        ax.legend(fontsize=9)
-        ax.set_ylim(0, 1.05)
-        ax.axhline(0.9, color='gray', linestyle='--', alpha=0.5,
-                   label='r=0.9 threshold')
+        ax.legend(fontsize=8)
+        ax.set_ylim(-0.05, 1.05)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         fig.tight_layout()
-        fig.savefig(f"{output_dir}/probing_comparison.png", dpi=150)
-        fig.savefig(f"{output_dir}/probing_comparison.pdf")
+        fig.savefig(f"{output_dir}/probing_k{k}.png", dpi=150)
         plt.close(fig)
-        print(f"  Saved: {output_dir}/probing_comparison.png")
-
-    except ImportError:
-        print("  matplotlib not available — skipping plots")
+        print(f"  Saved: {output_dir}/probing_k{k}.png")
 
 
-# =====================================================================
+# ---------------------------------------------------------------
 # CLI
-# =====================================================================
+# ---------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Probing evaluation for JEPA encoder"
+        description="Predictive probing for JEPA encoder"
     )
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to trained model checkpoint')
-    parser.add_argument('--data', type=str, default='data_100',
-                        help='Data directory')
-    parser.add_argument('--output', type=str, default='figures/probing',
-                        help='Output directory for results')
-    parser.add_argument('--probe-epochs', type=int, default=100,
-                        help='Epochs to train each probe')
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help='Batch size for embedding extraction')
-    parser.add_argument('--max-batches', type=int, default=None,
-                        help='Limit batches for quick test')
-    parser.add_argument('--baseline', action='store_true',
-                        help='Also run raw feature baseline')
+    parser.add_argument('--checkpoint', type=str, required=True)
+    parser.add_argument('--data', type=str, default='data_500')
+    parser.add_argument('--output', type=str, default='figures/probing')
+    parser.add_argument('--probe-epochs', type=int, default=100)
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--max-batches', type=int, default=None)
+    parser.add_argument('--horizons', type=int, nargs='+',
+                        default=DEFAULT_HORIZONS)
     parser.add_argument('--device', type=str, default='cpu')
-
     args = parser.parse_args()
 
-    # ── Load model ──
     print(f"\n  Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=args.device,
                       weights_only=False)
     config = ckpt.get('config', {})
 
-    # Add parent directory to path
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
     try:
         from ..models.world_model import OpticalWorldModel
         from ..training.dataset import create_dataloaders
@@ -529,7 +447,6 @@ def main():
         from models.world_model import OpticalWorldModel
         from training.dataset import create_dataloaders
 
-    # Reconstruct model from config
     model = OpticalWorldModel(
         latent_dim=config.get('latent_dim', 128),
         spectral_dim=config.get('spectral_dim', 64),
@@ -546,16 +463,11 @@ def main():
         predictor_type=config.get('predictor_type', 'transformer'),
         collapse_method=config.get('collapse_method', 'variance'),
     )
-
-    # Load weights (handle lazy-init node_proj)
-    state_dict = ckpt['model_state_dict']
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(ckpt['model_state_dict'], strict=False)
     model = model.to(args.device)
     model.eval()
-
     print(f"  Model loaded: {sum(p.numel() for p in model.parameters()):,} params")
 
-    # ── Create data loaders ──
     print(f"\n  Loading data from {args.data}...")
     train_loader, val_loader = create_dataloaders(
         data_dir=args.data,
@@ -565,38 +477,25 @@ def main():
         pin_memory=False,
     )
 
-    # ── Run probing ──
-    print(f"\n{'='*60}")
-    print(f"  Probing Evaluation")
-    print(f"{'='*60}")
+    print(f"\n{'='*66}")
+    print(f"  Predictive Probing Evaluation")
+    print(f"{'='*66}")
 
-    jepa_results = run_probing(
+    results = run_predictive_probing(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
+        horizons=args.horizons,
         device=args.device,
         n_probe_epochs=args.probe_epochs,
         max_extract_batches=args.max_batches,
     )
 
-    # ── Raw feature baseline ──
-    baseline_results = None
-    if args.baseline:
-        baseline_results = run_raw_feature_baseline(
-            train_loader=train_loader,
-            val_loader=val_loader,
-            latent_dim=config.get('latent_dim', 128),
-            device=args.device,
-            n_probe_epochs=args.probe_epochs,
-            max_extract_batches=args.max_batches,
-        )
+    generate_report(results, args.output)
 
-    # ── Generate report ──
-    generate_report(jepa_results, baseline_results, args.output)
-
-    print(f"\n{'='*60}")
+    print(f"\n{'='*66}")
     print(f"  Probing complete")
-    print(f"{'='*60}\n")
+    print(f"{'='*66}\n")
 
 
 if __name__ == "__main__":
