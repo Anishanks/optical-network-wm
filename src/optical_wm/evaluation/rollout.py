@@ -302,6 +302,56 @@ def compute_baseline_rollouts(
 
 
 # =====================================================================
+# Action shuffling sanity check
+# =====================================================================
+
+@torch.no_grad()
+def compute_rollout_metrics_shuffled(
+    model,
+    episodes: List[Dict],
+    max_horizon: int = 25,
+    device: str = 'cpu',
+    seed: int = 0,
+) -> Dict:
+    """
+    Rollout with shuffled actions: each episode's starting state is rolled
+    forward using actions borrowed from a different episode.
+
+    Compares MSE(real actions) vs MSE(shuffled actions). A large gap means
+    the predictor is action-conditioned; a small gap means it is essentially
+    ignoring actions and producing persistence-like trajectories.
+    """
+    n = len(episodes)
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    # Ensure no episode keeps its own action sequence
+    for i in range(n):
+        if perm[i] == i:
+            swap_with = (i + 1) % n
+            perm[i], perm[swap_with] = perm[swap_with], perm[i]
+
+    mse_per_horizon = defaultdict(list)
+    print(f"\n  Rolling out {n} episodes with SHUFFLED actions "
+          f"(max horizon={max_horizon})...")
+
+    for idx, ep in enumerate(episodes):
+        z_real = ep['z_real']
+        other_actions = episodes[int(perm[idx])]['actions']
+        T = z_real.shape[0]
+        H = min(max_horizon, T - 1, other_actions.shape[0])
+        if H < 1:
+            continue
+
+        z_pred = rollout_episode(model, z_real[0], other_actions[:H], device)
+        for h in range(1, H + 1):
+            mse = F.mse_loss(z_pred[h], z_real[h]).item()
+            mse_per_horizon[h].append(mse)
+
+    avg_mse = {h: float(np.mean(v)) for h, v in sorted(mse_per_horizon.items())}
+    return {'mse_per_horizon': avg_mse}
+
+
+# =====================================================================
 # Probing on predicted embeddings
 # =====================================================================
 
@@ -465,6 +515,12 @@ def generate_report(
         if baseline_metrics:
             lin = baseline_metrics.get('linear_ar', {})
             pers = baseline_metrics.get('persistence', {})
+            shuf = baseline_metrics.get('shuffled_actions', {})
+            if shuf:
+                hs = sorted(shuf.keys())
+                ax.plot(hs, [shuf[h] for h in hs], 'D-', color='#DC2626',
+                        linewidth=2, markersize=4,
+                        label='JEPA (shuffled actions)')
             if lin:
                 hs = sorted(lin.keys())
                 ax.plot(hs, [lin[h] for h in hs], 's-', color='#D97706',
@@ -635,21 +691,44 @@ def main():
         episodes, W, max_horizon=args.max_horizon
     )
 
+    # Action shuffling: does the predictor actually use actions?
+    shuffled_metrics = compute_rollout_metrics_shuffled(
+        model, episodes, max_horizon=args.max_horizon, device=args.device
+    )
+    baseline_metrics['shuffled_actions'] = shuffled_metrics['mse_per_horizon']
+
     # Print summary
     print(f"\n  ── MSE per Horizon ──")
-    print(f"  {'h':>4} {'JEPA':>10} {'linear-AR':>10} {'persist':>10} {'ratio J/L':>10}")
-    print(f"  {'-'*4} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+    print(f"  {'h':>4} {'JEPA':>10} {'shuffled':>10} {'linear-AR':>10} "
+          f"{'persist':>10} {'ratio J/S':>10}")
+    print(f"  {'-'*4} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
     lin = baseline_metrics['linear_ar']
     pers = baseline_metrics['persistence']
+    shuf = baseline_metrics['shuffled_actions']
     for h in sorted(rollout_metrics['mse_per_horizon'].keys()):
         mse = rollout_metrics['mse_per_horizon'][h]
+        s = shuf.get(h, float('nan'))
         l = lin.get(h, float('nan'))
         p = pers.get(h, float('nan'))
-        ratio = mse / max(l, 1e-12) if l == l else float('nan')
-        print(f"  {h:>4} {mse:>10.5f} {l:>10.5f} {p:>10.5f} {ratio:>10.3f}")
+        ratio_js = mse / max(s, 1e-12) if s == s else float('nan')
+        print(f"  {h:>4} {mse:>10.5f} {s:>10.5f} {l:>10.5f} "
+              f"{p:>10.5f} {ratio_js:>10.3f}")
+
+    # Action-conditioning check at h_max
+    h_max = rollout_metrics['h_max']
+    if h_max in shuf and h_max in rollout_metrics['mse_per_horizon']:
+        s_max = shuf[h_max]
+        m_max = rollout_metrics['mse_per_horizon'][h_max]
+        gap = s_max / max(m_max, 1e-12)
+        print(f"\n  Action-conditioning gap (shuffled/real) at h={h_max}: {gap:.2f}×")
+        if gap > 2.0:
+            print(f"  ✅ Predictor uses action information (gap > 2×)")
+        elif gap > 1.3:
+            print(f"  ⚠  Weak action-conditioning (gap {gap:.2f}×)")
+        else:
+            print(f"  ✗  Predictor largely ignores actions (gap ≈ 1×)")
 
     ratio = rollout_metrics['stability_ratio']
-    h_max = rollout_metrics['h_max']
     print(f"\n  Stability ratio (h={h_max}/h=1): {ratio:.1f}×")
 
     if ratio < 10:
