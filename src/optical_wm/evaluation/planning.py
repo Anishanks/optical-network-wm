@@ -1,446 +1,343 @@
 """
-Goal-Conditioned Planning Evaluation (Éval 3) for Optical Network World Model.
+Counterfactual Action Ranking Evaluation (simple planning PoC).
 
-Evaluates whether the world model can find action sequences that reach
-a goal state, using Cross-Entropy Method (CEM) in latent space.
+Tests whether the world model can discriminate the *real* action sequence
+recorded in the dataset from K *random* action sequences drawn from the
+empirical pool, using a trained probe as the scoring oracle.
 
 Protocol:
-  1. Sample (start_state, goal_state) pairs from dataset (separated by K steps)
-  2. Encode both: z_start = encoder(start), z_goal = encoder(goal)
-  3. CEM searches for action sequence minimizing distance(ẑ_final, z_goal)
-  4. Evaluate success rate at different thresholds
+  1. Extract val starting states + their real H-step action sequences
+  2. Build a pool of H-length action windows from train episodes
+  3. For each val state:
+       - Rollout real actions via predictor -> z_H_real
+       - Rollout K random action sequences    -> z_H_alt[1..K]
+       - Score every terminal latent with probe(z) -> predicted target
+       - Rank the real score among the K alternatives
+  4. Report:
+       - Distribution of rank percentiles (lower = real ranks higher)
+       - Mean predicted score: real vs random
+       - Correlation between predicted and true target at horizon H
 
-Metrics:
-  - Latent success rate: distance(ẑ_final, z_goal) < threshold
-  - Physical success rate: probed quantities within ±10% of goal
-  - Planning speedup: wall-clock CEM time vs horizon steps × GNPy time
+Interpretation:
+  If real action sequences (produced by margin-aware / provisioning-aware
+  policies) score higher than random alternatives on average, the model
+  has planning-useful discriminative ability -- a prerequisite for any
+  MPC / random-shooting planner -- without needing a real simulator in
+  the loop.
 
 Usage:
   python -m optical_wm.evaluation.planning \
-    --checkpoint checkpoints/v1/best.pt \
-    --data data_100 \
+    --checkpoint checkpoints/v2k_gnn_ctx16/best.pt \
+    --data data_2k \
+    --horizon 5 --n-alternatives 50 \
+    --target avg_margin \
     --output figures/planning
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import json
 import argparse
 import os
 import sys
-import time
-from pathlib import Path
-from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 try:
-    from .probing import LinearProbe, train_probe, PROBE_TARGETS
+    from .rollout import extract_episode_embeddings, rollout_episode
+    from .probing import LinearProbe, MLPProbe, train_probe, PROBE_TARGETS
 except ImportError:
-    from probing import LinearProbe, train_probe, PROBE_TARGETS
+    from rollout import extract_episode_embeddings, rollout_episode
+    from probing import LinearProbe, MLPProbe, train_probe, PROBE_TARGETS
 
 
 # =====================================================================
-# CEM Planner
+# Action pool from train episodes
 # =====================================================================
 
-class CEMPlanner:
+def build_action_pool(
+    episodes: List[Dict], horizon: int, max_windows: int = 20000,
+) -> torch.Tensor:
     """
-    Cross-Entropy Method planner in latent space.
-
-    Searches for an action sequence that drives the predicted
-    latent state from z_start toward z_goal.
+    Build a pool of H-length action windows from episodes.
+    Returns [N, H, A] tensor.
     """
-
-    def __init__(
-        self,
-        action_dim: int = 20,
-        horizon: int = 15,
-        population_size: int = 64,
-        elite_frac: float = 0.2,
-        n_iterations: int = 5,
-        action_mean: Optional[torch.Tensor] = None,
-        action_std: Optional[torch.Tensor] = None,
-    ):
-        self.action_dim = action_dim
-        self.horizon = horizon
-        self.population_size = population_size
-        self.n_elite = max(1, int(population_size * elite_frac))
-        self.n_iterations = n_iterations
-
-        # Prior distribution over actions
-        self.action_mean = action_mean if action_mean is not None else torch.zeros(action_dim)
-        self.action_std = action_std if action_std is not None else torch.ones(action_dim)
-
-    @torch.no_grad()
-    def plan(
-        self,
-        model,
-        z_start: torch.Tensor,
-        z_goal: torch.Tensor,
-        device: str = 'cpu',
-    ) -> Tuple[torch.Tensor, float]:
-        """
-        Find action sequence to reach z_goal from z_start.
-
-        Args:
-            model: world model with predictor.rollout()
-            z_start: [D] initial latent state
-            z_goal: [D] goal latent state
-            device: computation device
-        Returns:
-            best_actions: [H, A] best action sequence found
-            best_distance: float, final latent distance to goal
-        """
-        H = self.horizon
-        A = self.action_dim
-        N = self.population_size
-        D = z_start.shape[0]
-
-        z_start = z_start.to(device)
-        z_goal = z_goal.to(device)
-
-        # Initialize distribution: mean and std for each (horizon, action_dim)
-        mu = self.action_mean.unsqueeze(0).expand(H, A).clone().to(device)   # [H, A]
-        sigma = self.action_std.unsqueeze(0).expand(H, A).clone().to(device) # [H, A]
-
-        best_actions = None
-        best_distance = float('inf')
-
-        for iteration in range(self.n_iterations):
-            # Sample action sequences from current distribution
-            # [N, H, A]
-            noise = torch.randn(N, H, A, device=device)
-            action_seqs = mu.unsqueeze(0) + sigma.unsqueeze(0) * noise
-
-            # Rollout each sequence
-            z_init_batch = z_start.unsqueeze(0).expand(N, D)  # [N, D]
-            z_traj = model.predictor.rollout(z_init_batch, action_seqs)  # [N, H+1, D]
-
-            # Evaluate: distance of final predicted state to goal
-            z_final = z_traj[:, -1, :]  # [N, D]
-            distances = torch.norm(z_final - z_goal.unsqueeze(0), dim=-1)  # [N]
-
-            # Select elite
-            elite_idx = distances.argsort()[:self.n_elite]
-            elite_actions = action_seqs[elite_idx]  # [K, H, A]
-            elite_dist = distances[elite_idx]
-
-            # Update best
-            if elite_dist[0].item() < best_distance:
-                best_distance = elite_dist[0].item()
-                best_actions = elite_actions[0].cpu()
-
-            # Update distribution from elite
-            mu = elite_actions.mean(dim=0)      # [H, A]
-            sigma = elite_actions.std(dim=0).clamp(min=0.01)  # [H, A]
-
-        return best_actions, best_distance
+    windows = []
+    for ep in episodes:
+        actions = ep['actions']           # [T-1, A]
+        n = actions.shape[0]
+        if n < horizon:
+            continue
+        for t in range(n - horizon + 1):
+            windows.append(actions[t:t + horizon])
+            if len(windows) >= max_windows:
+                break
+        if len(windows) >= max_windows:
+            break
+    if not windows:
+        raise RuntimeError("Empty action pool: episodes too short for horizon")
+    return torch.stack(windows)           # [N, H, A]
 
 
 # =====================================================================
-# Compute action statistics from dataset
+# Probe training on real (z_t, y_t) pairs
 # =====================================================================
 
-def compute_action_stats(data_loader) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute mean and std of actions across the dataset.
-    Used as prior for CEM sampling.
-    """
-    all_actions = []
-    for batch in data_loader:
-        actions = batch['actions']  # [B, T-1, A]
-        all_actions.append(actions.reshape(-1, actions.shape[-1]))
+def train_target_probe(
+    train_episodes: List[Dict],
+    val_episodes: List[Dict],
+    target: str = 'avg_margin',
+    probe_type: str = 'mlp',
+    n_epochs: int = 100,
+    device: str = 'cpu',
+) -> Tuple[nn.Module, Dict]:
+    """Train a probe z -> global_features[target] on real encoder outputs."""
+    idx = PROBE_TARGETS[target]['idx']
 
-    all_actions = torch.cat(all_actions, dim=0)  # [N, A]
-    return all_actions.mean(dim=0), all_actions.std(dim=0).clamp(min=0.1)
+    def collect(eps):
+        zs, ys = [], []
+        for ep in eps:
+            z = ep['z_real']                # [T, D]
+            gf = ep['global_features']      # [T, 8]
+            for t in range(z.shape[0]):
+                zs.append(z[t])
+                ys.append(gf[t, idx])
+        return torch.stack(zs), torch.stack(ys)
+
+    z_train, y_train = collect(train_episodes)
+    z_val, y_val = collect(val_episodes)
+
+    D = z_train.shape[1]
+    probe_cls = MLPProbe if probe_type == 'mlp' else LinearProbe
+    probe = probe_cls(D)
+    metrics = train_probe(
+        probe, z_train, y_train, z_val, y_val,
+        n_epochs=n_epochs, device=device,
+    )
+    return probe, metrics
 
 
 # =====================================================================
-# Sample goal pairs from dataset
+# Rank real-vs-random
 # =====================================================================
 
 @torch.no_grad()
-def sample_goal_pairs(
+def rank_real_vs_random(
     model,
-    data_loader,
-    n_pairs: int = 50,
-    min_gap: int = 10,
-    max_gap: int = 25,
+    probe: nn.Module,
+    val_episodes: List[Dict],
+    action_pool: torch.Tensor,
+    horizon: int = 5,
+    n_alternatives: int = 50,
+    target: str = 'avg_margin',
+    maximize: bool = True,
     device: str = 'cpu',
-) -> List[Dict]:
-    """
-    Sample (start, goal) pairs from the dataset.
-
-    For each pair:
-      - start and goal are from the same episode
-      - separated by min_gap to max_gap steps
-      - we store z_start, z_goal, real actions, and real global_features
-
-    Returns list of dicts.
-    """
-    model.eval()
-    pairs = []
-
-    for batch in data_loader:
-        if len(pairs) >= n_pairs:
-            break
-
-        batch_dev = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
-
-        actions = batch_dev.pop('actions')  # [B, T-1, A]
-        T = batch_dev['global_features'].shape[1]
-        B = actions.shape[0]
-
-        # Encode all timesteps
-        z_seq = []
-        for t in range(T):
-            step_batch = {}
-            for key, val in batch_dev.items():
-                if val.dim() >= 2 and val.shape[1] == T:
-                    step_batch[key] = val[:, t]
-                else:
-                    step_batch[key] = val
-            z_t = model.encoder(step_batch)
-            z_seq.append(z_t)
-
-        z_all = torch.stack(z_seq, dim=1)  # [B, T, D]
-
-        for b in range(B):
-            if len(pairs) >= n_pairs:
-                break
-
-            # Sample a gap
-            gap = np.random.randint(min_gap, min(max_gap + 1, T))
-            t_start = 0
-            t_goal = t_start + gap
-
-            if t_goal >= T:
-                continue
-
-            pairs.append({
-                'z_start': z_all[b, t_start].cpu(),
-                'z_goal': z_all[b, t_goal].cpu(),
-                'real_actions': actions[b, t_start:t_goal].cpu(),  # [gap, A]
-                'gf_start': batch['global_features'][b, t_start].cpu(),
-                'gf_goal': batch['global_features'][b, t_goal].cpu(),
-                'gap': gap,
-            })
-
-    return pairs
-
-
-# =====================================================================
-# Train probes for physical success evaluation
-# =====================================================================
-
-def train_probes_for_planning(
-    model, data_loader, device: str = 'cpu',
-) -> Dict[str, nn.Module]:
-    """Train linear probes on real embeddings for each physical quantity."""
-    # Extract embeddings
-    all_z, all_gf = [], []
-    with torch.no_grad():                        
-        for batch in data_loader:
-            batch_dev = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                        for k, v in batch.items()}
-            batch_dev.pop('actions', None)
-            T = batch_dev['global_features'].shape[1]
-
-            for t in range(T):
-                step_batch = {}
-                for key, val in batch_dev.items():
-                    if val.dim() >= 2 and val.shape[1] == T:
-                        step_batch[key] = val[:, t]
-                    else:
-                        step_batch[key] = val
-                z_t = model.encoder(step_batch)
-                all_z.append(z_t.cpu())
-                all_gf.append(step_batch['global_features'].cpu())
-
-    z_all = torch.cat(all_z, dim=0)
-    gf_all = torch.cat(all_gf, dim=0)
-
-    D = z_all.shape[1]
-    n_val = max(1, len(z_all) // 5)
-
-    probes = {}
-    for target_key, target_info in PROBE_TARGETS.items():
-        idx = target_info['idx']
-        y = gf_all[:, idx]
-        if y.std() < 1e-6:
-            continue
-
-        probe = LinearProbe(D)
-        train_probe(
-            probe,
-            z_all[n_val:], y[n_val:],
-            z_all[:n_val], y[:n_val],
-            n_epochs=100, device=device,
-        )
-        probes[target_key] = probe
-
-    return probes
-
-
-# =====================================================================
-# Evaluate planning
-# =====================================================================
-
-def evaluate_planning(
-    model,
-    pairs: List[Dict],
-    planner: CEMPlanner,
-    probes: Dict[str, nn.Module] = None,
-    device: str = 'cpu',
+    seed: int = 0,
 ) -> Dict:
     """
-    Run CEM planning on all pairs and evaluate.
+    For each val episode:
+      - Rollout real actions for `horizon` steps, score terminal z
+      - Rollout K random action sequences from pool, score terminal z
+      - Compute rank percentile of real among alternatives
+
+    Rank percentile convention:
+       0.0 -> real ranks best, 1.0 -> real ranks worst among K+1.
     """
-    results = {
-        'latent_distances': [],
-        'planning_times': [],
-        'physical_success': defaultdict(list),
-        'per_pair': [],
+    idx_target = PROBE_TARGETS[target]['idx']
+    rng = np.random.default_rng(seed)
+    N_pool = action_pool.shape[0]
+
+    model.eval()
+    probe = probe.to(device).eval()
+
+    real_scores: List[float] = []
+    rand_mean_scores: List[float] = []
+    rand_best_scores: List[float] = []
+    rand_dispersion: List[float] = []
+    rank_percentiles: List[float] = []
+    real_true: List[float] = []
+
+    n_skipped = 0
+    for ep in val_episodes:
+        z_real = ep['z_real']             # [T, D]
+        actions = ep['actions']           # [T-1, A]
+        T = z_real.shape[0]
+        if T - 1 < horizon:
+            n_skipped += 1
+            continue
+
+        z_0 = z_real[0]
+        real_actions = actions[:horizon]
+
+        # Rollout real
+        z_pred_real = rollout_episode(model, z_0, real_actions, device)  # [H+1, D]
+        score_real = probe(
+            z_pred_real[-1].unsqueeze(0).to(device)
+        ).item()
+
+        # Rollout K random alternatives in a batched call
+        sample_idx = rng.choice(N_pool, size=n_alternatives, replace=False)
+        alt_actions = action_pool[sample_idx].to(device)                   # [K, H, A]
+        z_init_batch = z_0.unsqueeze(0).expand(n_alternatives, -1).to(device)
+        z_traj_batch = model.predictor.rollout(z_init_batch, alt_actions)  # [K, H+1, D]
+        z_final_batch = z_traj_batch[:, -1]                                # [K, D]
+        scores_alt = probe(z_final_batch).cpu().numpy()                    # [K]
+
+        # Rank percentile
+        if maximize:
+            n_better = (scores_alt > score_real).sum()
+        else:
+            n_better = (scores_alt < score_real).sum()
+        rank_pct = n_better / n_alternatives
+
+        real_scores.append(score_real)
+        rand_mean_scores.append(float(scores_alt.mean()))
+        rand_best_scores.append(
+            float(scores_alt.max() if maximize else scores_alt.min())
+        )
+        rand_dispersion.append(float(scores_alt.std()))
+        rank_percentiles.append(float(rank_pct))
+
+        if horizon < T:
+            real_true.append(float(ep['global_features'][horizon, idx_target]))
+
+    return {
+        'real_scores': real_scores,
+        'rand_mean_scores': rand_mean_scores,
+        'rand_best_scores': rand_best_scores,
+        'rand_dispersion': rand_dispersion,
+        'rank_percentiles': rank_percentiles,
+        'real_true_values': real_true,
+        'n_evaluated': len(real_scores),
+        'n_skipped': n_skipped,
     }
 
-    n_pairs = len(pairs)
-    print(f"\n  Planning {n_pairs} goal pairs (CEM: pop={planner.population_size}, "
-          f"iter={planner.n_iterations}, horizon={planner.horizon})...")
-
-    for idx, pair in enumerate(pairs):
-        z_start = pair['z_start']
-        z_goal = pair['z_goal']
-        gap = pair['gap']
-
-        # Plan
-        t0 = time.time()
-        planned_actions, latent_dist = planner.plan(
-            model, z_start, z_goal, device
-        )
-        plan_time = time.time() - t0
-
-        results['latent_distances'].append(latent_dist)
-        results['planning_times'].append(plan_time)
-
-        # Physical success: probe the predicted final state
-        pair_result = {
-            'gap': gap,
-            'latent_distance': latent_dist,
-            'plan_time': plan_time,
-        }
-
-        if probes:
-            # Get predicted final state
-            z_init = z_start.unsqueeze(0).to(device)
-            a_seq = planned_actions.unsqueeze(0).to(device)
-            z_traj = model.predictor.rollout(z_init, a_seq)
-            z_final = z_traj[0, -1].cpu()
-
-            for target_key, probe in probes.items():
-                probe.eval()
-                with torch.no_grad():
-                    pred_val = probe(z_final.unsqueeze(0)).item()
-                    goal_val = pair['gf_goal'][PROBE_TARGETS[target_key]['idx']].item()
-
-                    if abs(goal_val) > 1e-6:
-                        rel_error = abs(pred_val - goal_val) / abs(goal_val)
-                    else:
-                        rel_error = abs(pred_val - goal_val)
-
-                    success = rel_error < 0.10  # within 10%
-                    results['physical_success'][target_key].append(success)
-                    pair_result[f'{target_key}_pred'] = pred_val
-                    pair_result[f'{target_key}_goal'] = goal_val
-                    pair_result[f'{target_key}_error'] = rel_error
-
-        results['per_pair'].append(pair_result)
-
-        if (idx + 1) % 10 == 0 or idx == n_pairs - 1:
-            avg_dist = np.mean(results['latent_distances'])
-            avg_time = np.mean(results['planning_times'])
-            print(f"    [{idx+1}/{n_pairs}] avg dist={avg_dist:.4f}, "
-                  f"avg time={avg_time:.2f}s")
-
-    return results
-
 
 # =====================================================================
-# Report
+# Reporting
 # =====================================================================
 
-def print_report(results: Dict, planner: CEMPlanner):
-    """Print planning evaluation summary."""
-    dists = np.array(results['latent_distances'])
-    times = np.array(results['planning_times'])
+def print_report(
+    results: Dict, probe_metrics: Dict,
+    target: str, horizon: int, n_alt: int, maximize: bool,
+):
+    real = np.asarray(results['real_scores'])
+    rand_mean = np.asarray(results['rand_mean_scores'])
+    rand_best = np.asarray(results['rand_best_scores'])
+    ranks = np.asarray(results['rank_percentiles'])
+    real_true = np.asarray(results['real_true_values'])
 
-    print(f"\n  ── Latent Distance ──")
-    print(f"    Mean:   {dists.mean():.4f}")
-    print(f"    Median: {np.median(dists):.4f}")
-    print(f"    Min:    {dists.min():.4f}")
-    print(f"    Max:    {dists.max():.4f}")
+    direction = 'maximize' if maximize else 'minimize'
+    name = PROBE_TARGETS[target]['name']
 
-    # Success rates at various thresholds
-    print(f"\n  ── Latent Success Rate ──")
-    for threshold in [0.5, 1.0, 2.0, 5.0]:
-        rate = (dists < threshold).mean()
-        print(f"    dist < {threshold:.1f}: {rate:.0%}")
+    print(f"\n  ── Probe quality (on real (z, y) pairs) ──")
+    print(f"    target:         {name}")
+    print(f"    probe val MSE:  {probe_metrics['mse']:.4f}")
+    print(f"    probe val r:    {probe_metrics['pearson_r']:.3f}")
+    print(f"    probe val R2:   {probe_metrics['r_squared']:.3f}")
 
-    # Physical success
-    if results['physical_success']:
-        print(f"\n  ── Physical Success Rate (within ±10%) ──")
-        for target, successes in sorted(results['physical_success'].items()):
-            rate = np.mean(successes)
-            name = PROBE_TARGETS[target]['name']
-            print(f"    {name:<28} {rate:.0%}")
+    print(f"\n  ── Action Ranking (h={horizon}, K={n_alt}, {direction}) ──")
+    print(f"    n_evaluated:    {results['n_evaluated']}")
+    print(f"    n_skipped:      {results['n_skipped']} (episodes too short)")
 
-    # Planning speed
-    print(f"\n  ── Planning Speed ──")
-    print(f"    Avg time per plan:  {times.mean():.2f}s")
-    print(f"    Horizon:            {planner.horizon} steps")
-    print(f"    CEM iterations:     {planner.n_iterations}")
-    print(f"    Population size:    {planner.population_size}")
+    if results['n_evaluated'] == 0:
+        print("    No usable episodes; aborting report")
+        return
 
-    # Speedup estimate vs GNPy
-    # GNPy takes ~60ms per step on average (from dataset generation)
-    gnpy_time = planner.horizon * 0.06  # seconds
-    speedup = gnpy_time * planner.population_size * planner.n_iterations / max(times.mean(), 0.001)
-    print(f"    Est. GNPy equivalent: {gnpy_time * planner.population_size * planner.n_iterations:.1f}s")
-    print(f"    Planning speedup:     ~{speedup:.0f}×")
+    print(f"\n    Predicted {name} (via probe on terminal latent):")
+    print(f"      real actions:     mean={real.mean():.4f}  "
+          f"median={np.median(real):.4f}")
+    print(f"      random actions:   mean={rand_mean.mean():.4f}  "
+          f"median={np.median(rand_mean):.4f}")
+    print(f"      random best-of-K: mean={rand_best.mean():.4f}  "
+          f"median={np.median(rand_best):.4f}")
+
+    gap = (real.mean() - rand_mean.mean())
+    gap_sign = '+' if gap >= 0 else ''
+    print(f"      real - random mean gap: {gap_sign}{gap:.4f}")
+
+    print(f"\n    Rank percentile of real actions (0 = best of K+1):")
+    print(f"      mean:           {ranks.mean():.3f}")
+    print(f"      median:         {np.median(ranks):.3f}")
+    print(f"      top-10%  rate:  {(ranks < 0.10).mean():.0%}")
+    print(f"      top-25%  rate:  {(ranks < 0.25).mean():.0%}")
+    print(f"      below-median:   {(ranks < 0.50).mean():.0%}")
+
+    # Ground-truth correlation: is the probe's terminal score aligned
+    # with the *actual* observed target at horizon?
+    if len(real_true) == len(real) and len(real_true) > 2:
+        if real.std() > 1e-8 and real_true.std() > 1e-8:
+            r = float(np.corrcoef(real, real_true)[0, 1])
+            print(f"\n    Pearson r (predicted vs real ground-truth "
+                  f"{name} at h={horizon}):")
+            print(f"      r = {r:.3f}")
+
+    # Narrative verdict
+    mean_rank = ranks.mean()
+    print(f"\n  ── Verdict ──")
+    if maximize and mean_rank < 0.25 and gap > 0:
+        print("    ✅ Model ranks real actions in top 25% on average -- "
+              "planner-ready discriminative ability")
+    elif (not maximize) and mean_rank < 0.25 and gap < 0:
+        print("    ✅ Model ranks real actions in top 25% on average -- "
+              "planner-ready discriminative ability")
+    elif mean_rank < 0.50:
+        print("    ⚠  Model weakly discriminates real from random actions")
+    else:
+        print("    ✗  Model does not distinguish real actions from random "
+              "alternatives under this objective")
 
 
-def save_report(results: Dict, output_dir: str):
-    """Save results and generate plots."""
+def save_report(
+    results: Dict, probe_metrics: Dict,
+    target: str, horizon: int, n_alt: int, maximize: bool,
+    output_dir: str,
+):
     os.makedirs(output_dir, exist_ok=True)
 
-    # Clean results for JSON (remove non-serializable)
-    export = {
-        'latent_distances': results['latent_distances'],
-        'planning_times': results['planning_times'],
-        'physical_success': {
-            k: [bool(s) for s in v]
-            for k, v in results['physical_success'].items()
-        },
-        'summary': {
-            'mean_distance': float(np.mean(results['latent_distances'])),
-            'median_distance': float(np.median(results['latent_distances'])),
-            'mean_plan_time': float(np.mean(results['planning_times'])),
-        },
+    real = np.asarray(results['real_scores'])
+    rand_mean = np.asarray(results['rand_mean_scores'])
+    rand_best = np.asarray(results['rand_best_scores'])
+    ranks = np.asarray(results['rank_percentiles'])
+    real_true = np.asarray(results['real_true_values'])
+
+    summary = {
+        'target': target,
+        'horizon': horizon,
+        'n_alternatives': n_alt,
+        'maximize': maximize,
+        'n_evaluated': results['n_evaluated'],
+        'n_skipped': results['n_skipped'],
+        'probe_val_metrics': probe_metrics,
+        'predicted_real_mean': float(real.mean()) if real.size else None,
+        'predicted_random_mean': float(rand_mean.mean()) if rand_mean.size else None,
+        'predicted_random_best_mean': float(rand_best.mean()) if rand_best.size else None,
+        'rank_percentile_mean': float(ranks.mean()) if ranks.size else None,
+        'rank_percentile_median': float(np.median(ranks)) if ranks.size else None,
+        'top10_rate': float((ranks < 0.10).mean()) if ranks.size else None,
+        'top25_rate': float((ranks < 0.25).mean()) if ranks.size else None,
+        'below_median_rate': float((ranks < 0.50).mean()) if ranks.size else None,
     }
 
-    # Add physical success rates
-    if results['physical_success']:
-        export['summary']['physical_success_rates'] = {
-            k: float(np.mean(v))
-            for k, v in results['physical_success'].items()
-        }
+    if len(real_true) == len(real) and len(real_true) > 2 and \
+            real.std() > 1e-8 and real_true.std() > 1e-8:
+        summary['predicted_vs_truth_pearson_r'] = float(
+            np.corrcoef(real, real_true)[0, 1]
+        )
 
     with open(f"{output_dir}/planning_results.json", 'w') as f:
-        json.dump(export, f, indent=2)
+        json.dump({
+            'summary': summary,
+            'per_episode': {
+                'real_scores': results['real_scores'],
+                'rand_mean_scores': results['rand_mean_scores'],
+                'rand_best_scores': results['rand_best_scores'],
+                'rank_percentiles': results['rank_percentiles'],
+                'real_true_values': results['real_true_values'],
+            },
+        }, f, indent=2)
     print(f"\n  Saved: {output_dir}/planning_results.json")
 
-    # Plot
+    # ── Plots ──
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -448,49 +345,52 @@ def save_report(results: Dict, output_dir: str):
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
 
-        # Left: latent distance histogram
+        # Left: predicted score distributions (real vs random-mean vs random-best)
         ax = axes[0]
-        ax.hist(results['latent_distances'], bins=20, color='#065A82',
-                alpha=0.8, edgecolor='white')
-        ax.axvline(np.median(results['latent_distances']), color='#DC2626',
-                   linestyle='--', label=f"Median: {np.median(results['latent_distances']):.2f}")
-        ax.set_xlabel('Latent Distance to Goal')
-        ax.set_ylabel('Count')
-        ax.set_title('CEM Planning: Distance to Goal')
-        ax.legend()
+        name = PROBE_TARGETS[target]['name']
+        ax.hist(rand_mean, bins=25, color='#9CA3AF', alpha=0.6,
+                label='random (mean of K)', edgecolor='white')
+        ax.hist(rand_best, bins=25, color='#FBBF24', alpha=0.5,
+                label=f'random (best of K={n_alt})', edgecolor='white')
+        ax.hist(real, bins=25, color='#065A82', alpha=0.8,
+                label='real actions', edgecolor='white')
+        ax.set_xlabel(f'Predicted {name} at h={horizon}')
+        ax.set_ylabel('Episodes')
+        ax.set_title('Score distribution: real vs random action sequences')
+        ax.legend(fontsize=8)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
 
-        # Right: physical success rates
-        if results['physical_success']:
-            ax = axes[1]
-            targets = sorted(results['physical_success'].keys())
-            rates = [np.mean(results['physical_success'][t]) for t in targets]
-            names = [PROBE_TARGETS[t]['name'] for t in targets]
-            colors_map = {
-                'n_active_lps': '#065A82', 'total_capacity': '#7C3AED',
-                'worst_margin': '#D97706', 'avg_margin': '#059669',
-                'spectral_util': '#DC2626', 'n_infeasible': '#888888',
-            }
-            cols = [colors_map.get(t, '#888888') for t in targets]
-            bars = ax.bar(range(len(targets)), rates, color=cols)
-            ax.set_xticks(range(len(targets)))
-            ax.set_xticklabels(names, rotation=25, ha='right', fontsize=8)
-            ax.set_ylabel('Success Rate (±10%)')
-            ax.set_title('Physical Quantity Match at Goal')
-            ax.set_ylim(0, 1.05)
-            ax.axhline(0.5, color='gray', linestyle='--', alpha=0.3)
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
+        # Right: rank percentile CDF
+        ax = axes[1]
+        sorted_ranks = np.sort(ranks)
+        cdf = np.arange(1, len(sorted_ranks) + 1) / len(sorted_ranks)
+        ax.plot(sorted_ranks, cdf, '-', color='#065A82', linewidth=2,
+                label='model')
+        # Baseline: uniform distribution over ranks
+        ax.plot([0, 1], [0, 1], '--', color='#6B7280',
+                alpha=0.6, label='uniform (no discrimination)')
+        ax.axvline(0.10, color='#DC2626', linestyle=':', alpha=0.5,
+                   label='top 10%')
+        ax.axvline(0.25, color='#D97706', linestyle=':', alpha=0.5,
+                   label='top 25%')
+        ax.set_xlabel('Rank percentile of real (0 = best)')
+        ax.set_ylabel('Fraction of episodes ≤ x')
+        ax.set_title('CDF of real-action rank among K random alternatives')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.legend(fontsize=8, loc='lower right')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
 
         fig.tight_layout()
-        fig.savefig(f"{output_dir}/planning_results.png", dpi=150)
-        fig.savefig(f"{output_dir}/planning_results.pdf")
+        fig.savefig(f"{output_dir}/planning_action_ranking.png", dpi=150)
+        fig.savefig(f"{output_dir}/planning_action_ranking.pdf")
         plt.close(fig)
-        print(f"  Saved: planning_results.png")
+        print(f"  Saved: {output_dir}/planning_action_ranking.png")
 
     except ImportError:
-        print("  matplotlib not available — skipping plots")
+        print("  matplotlib not available -- skipping plots")
 
 
 # =====================================================================
@@ -499,28 +399,30 @@ def save_report(results: Dict, output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Goal-conditioned planning evaluation"
+        description="Counterfactual action ranking evaluation"
     )
     parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--data', type=str, default='data_100')
+    parser.add_argument('--data', type=str, required=True)
     parser.add_argument('--output', type=str, default='figures/planning')
-    parser.add_argument('--n-pairs', type=int, default=50,
-                        help='Number of (start, goal) pairs to test')
-    parser.add_argument('--horizon', type=int, default=15,
-                        help='Planning horizon (CEM action sequence length)')
-    parser.add_argument('--min-gap', type=int, default=10,
-                        help='Minimum steps between start and goal')
-    parser.add_argument('--max-gap', type=int, default=25,
-                        help='Maximum steps between start and goal')
-    parser.add_argument('--population', type=int, default=64,
-                        help='CEM population size')
-    parser.add_argument('--cem-iterations', type=int, default=5,
-                        help='CEM refinement iterations')
-    parser.add_argument('--no-probes', action='store_true',
-                        help='Skip physical quantity evaluation')
-    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--target', type=str, default='avg_margin',
+                        choices=list(PROBE_TARGETS.keys()))
+    parser.add_argument('--horizon', type=int, default=5,
+                        help='Planning horizon (action sequence length)')
+    parser.add_argument('--n-alternatives', type=int, default=50,
+                        help='Random action sequences sampled per episode')
+    parser.add_argument('--max-val-episodes', type=int, default=200)
+    parser.add_argument('--max-train-batches', type=int, default=None,
+                        help='Cap train batches used for probe + pool')
+    parser.add_argument('--max-pool-windows', type=int, default=20000)
+    parser.add_argument('--probe-type', type=str, default='mlp',
+                        choices=['linear', 'mlp'])
+    parser.add_argument('--probe-epochs', type=int, default=100)
+    parser.add_argument('--minimize', action='store_true',
+                        help='Minimize target instead of maximize '
+                             '(e.g. for n_infeasible)')
+    parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--device', type=str, default='cpu')
-
+    parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
     # ── Load model ──
@@ -553,78 +455,84 @@ def main():
         predictor_type=config.get('predictor_type', 'transformer'),
         collapse_method=config.get('collapse_method', 'variance'),
     )
-
     model.load_state_dict(ckpt['model_state_dict'], strict=False)
     model = model.to(args.device)
     model.eval()
     print(f"  Model loaded: {sum(p.numel() for p in model.parameters()):,} params")
 
-    # ── Load data ──
+    # ── Data ──
     print(f"\n  Loading data from {args.data}...")
-    # Use longer context for goal sampling
-    context_len = min(args.max_gap + 1, 32)
-
+    rollout_context = max(args.horizon + 1, 8)
     train_loader, val_loader = create_dataloaders(
         data_dir=args.data,
-        context_length=context_len,
+        context_length=rollout_context,
         batch_size=args.batch_size,
         num_workers=0,
         pin_memory=False,
     )
 
-    # ── Compute action statistics ──
-    print(f"  Computing action statistics...")
-    action_mean, action_std = compute_action_stats(train_loader)
-    print(f"    Action mean range: [{action_mean.min():.2f}, {action_mean.max():.2f}]")
-    print(f"    Action std range:  [{action_std.min():.2f}, {action_std.max():.2f}]")
-
-    # ── Sample goal pairs ──
-    print(f"  Sampling {args.n_pairs} goal pairs (gap {args.min_gap}-{args.max_gap})...")
-    pairs = sample_goal_pairs(
-        model, val_loader,
-        n_pairs=args.n_pairs,
-        min_gap=args.min_gap,
-        max_gap=min(args.max_gap, context_len - 1),
-        device=args.device,
+    # ── Extract episodes ──
+    val_max_batches = (args.max_val_episodes // args.batch_size + 1
+                       if args.max_val_episodes else None)
+    val_episodes = extract_episode_embeddings(
+        model, val_loader, args.device, max_batches=val_max_batches,
     )
-    print(f"  Got {len(pairs)} pairs")
+    print(f"  Extracted {len(val_episodes)} val episode windows")
 
-    if not pairs:
-        print("  ERROR: No valid pairs found. Try reducing --min-gap")
-        return
-
-    # ── Train probes ──
-    probes = None
-    if not args.no_probes:
-        print(f"\n  Training probes for physical evaluation...")
-        probes = train_probes_for_planning(model, train_loader, args.device)
-        print(f"    Trained {len(probes)} probes")
-
-    # ── Create planner ──
-    planner = CEMPlanner(
-        action_dim=action_mean.shape[0],
-        horizon=args.horizon,
-        population_size=args.population,
-        n_iterations=args.cem_iterations,
-        action_mean=action_mean,
-        action_std=action_std,
+    train_episodes = extract_episode_embeddings(
+        model, train_loader, args.device, max_batches=args.max_train_batches,
     )
+    print(f"  Extracted {len(train_episodes)} train episode windows")
 
-    # ── Run planning ──
+    # ── Train probe ──
+    print(f"\n  Training {args.probe_type} probe on '{args.target}'...")
+    probe, probe_metrics = train_target_probe(
+        train_episodes, val_episodes,
+        target=args.target, probe_type=args.probe_type,
+        n_epochs=args.probe_epochs, device=args.device,
+    )
+    print(f"    val MSE={probe_metrics['mse']:.4f} "
+          f"r={probe_metrics['pearson_r']:.3f} "
+          f"R2={probe_metrics['r_squared']:.3f}")
+
+    # ── Action pool ──
+    print(f"\n  Building action pool (horizon={args.horizon}, "
+          f"max_windows={args.max_pool_windows})...")
+    action_pool = build_action_pool(
+        train_episodes, args.horizon, max_windows=args.max_pool_windows,
+    )
+    print(f"    pool size: {action_pool.shape[0]} action windows, "
+          f"A={action_pool.shape[-1]}")
+
+    # ── Run ranking ──
     print(f"\n{'='*60}")
-    print(f"  Goal-Conditioned Planning Evaluation")
+    print(f"  Counterfactual Action Ranking")
     print(f"{'='*60}")
 
-    results = evaluate_planning(
-        model, pairs, planner, probes, args.device
+    results = rank_real_vs_random(
+        model, probe, val_episodes, action_pool,
+        horizon=args.horizon,
+        n_alternatives=args.n_alternatives,
+        target=args.target,
+        maximize=not args.minimize,
+        device=args.device,
+        seed=args.seed,
     )
 
-    # ── Report ──
-    print_report(results, planner)
-    save_report(results, args.output)
+    print_report(
+        results, probe_metrics,
+        target=args.target, horizon=args.horizon,
+        n_alt=args.n_alternatives, maximize=not args.minimize,
+    )
+    save_report(
+        results, probe_metrics,
+        target=args.target, horizon=args.horizon,
+        n_alt=args.n_alternatives, maximize=not args.minimize,
+        output_dir=args.output,
+    )
 
     print(f"\n{'='*60}")
-    print(f"  Planning evaluation complete")
+    print(f"  Action ranking evaluation complete")
     print(f"{'='*60}\n")
 
 
